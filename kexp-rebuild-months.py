@@ -110,8 +110,9 @@ for month, mname in MONTHS:
             if m:
                 uris.append(m[0])
             time.sleep(0.05)
-        with open(cache_path, "w") as f:
-            json.dump(uris, f)
+        # PR4: atomic — a concurrent rebuild of the same month reading this
+        # cache (or a kill mid-write) can never see a truncated URI list
+        mplib.atomic_write_json(cache_path, uris)
         print(f"  → found {len(uris)}/{len(tracks)} (cached)")
     if mplib.SEARCH_ERRORS:
         print(f"  Search errors: {mplib.SEARCH_ERRORS} (timeouts: {mplib.SEARCH_TIMEOUTS})")

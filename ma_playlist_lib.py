@@ -73,11 +73,9 @@ def load_unavailable():
 
 
 def _save_unavailable(store):
-    os.makedirs(os.path.dirname(UNAVAILABLE_FILE), exist_ok=True)
-    tmp = UNAVAILABLE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(store, f, indent=1, sort_keys=True)
-    os.replace(tmp, UNAVAILABLE_FILE)   # atomic — readers never see partial
+    """Persist the store atomically (PR4), keys sorted for stable diffs."""
+    atomic_write_json(UNAVAILABLE_FILE,
+                      {k: store[k] for k in sorted(store)}, indent=1)
 
 
 def _modify_unavailable(fn):
@@ -153,6 +151,36 @@ def clear_unavailable_many(station, month, items):
 def clear_unavailable(station, month, dj, artist, title):
     """Single-track convenience wrapper."""
     clear_unavailable_many(station, month, [(dj, artist, title)])
+
+
+def atomic_write_json(filepath, data, indent=None):
+    """Write JSON atomically: tmp file in the SAME directory + os.replace.
+
+    PR4 (24 Aug 2026): plain open(path, 'w') truncates before writing, so any
+    concurrent reader (dashboard thread, /api/runs poller, restart-time cache
+    load) can observe a half-written or empty file and blow up with
+    JSONDecodeError. Writing to a temp file in the target's directory then
+    os.replace()ing it is atomic on POSIX — readers only ever see the old or
+    the new complete file. fsync before replace so a crash can't leave a
+    zero-length 'new' file on ext4 (data=ordered).
+    """
+    import tempfile
+    d = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(d, exist_ok=True)
+    fd = tempfile.NamedTemporaryFile("w", dir=d, delete=False,
+                                     prefix=".tmp-", suffix=".json")
+    try:
+        with fd:
+            json.dump(data, fd, indent=indent)
+            fd.flush()
+            os.fsync(fd.fileno())
+        os.replace(fd.name, filepath)
+    except BaseException:
+        try:
+            os.unlink(fd.name)
+        except OSError:
+            pass
+        raise
 
 
 def get_ma_token():
