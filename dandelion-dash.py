@@ -476,6 +476,15 @@ class Handler(BaseHTTPRequestHandler):
                              f"Wait or cancel before triggering another."}).encode())
                 return
             existing = lib.existing_for(month, dj, station)
+            if existing is None:
+                # Fail-loud (23 Aug 2026): MA unreachable — cannot tell
+                # "no playlists" from "MA down", so auto/dry mode could
+                # misroute a fill into create. Abort instead of guessing.
+                self._send(503, json.dumps({
+                    "ok": False,
+                    "error": "Music Assistant unreachable — cannot determine "
+                             "existing playlists. Retry once MA is back."}).encode())
+                return
             if mode == "auto":
                 fill = bool(existing)
                 resume = not fill
