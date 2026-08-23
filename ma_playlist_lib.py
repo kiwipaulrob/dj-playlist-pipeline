@@ -289,6 +289,46 @@ def _do_search(token, payload):
         return None
 
 
+def _clean_title(title):
+    """Strip release-noise suffixes from a tracklist title (PR-B, 24 Aug 2026).
+
+    Radio tracklists are littered with "(Remastered 2011)", "[Live at BBC]",
+    "- Radio Edit" qualifiers. MA indexes the CANONICAL title, so queries
+    carrying the noise underperform. Only bracketed/dashed qualifier patterns
+    are removed — the core wording is never touched. SAFE by construction:
+    this only changes what we SEARCH FOR; matching/validation still runs in
+    _pick_best against the original artist+title.
+    """
+    t = title or ""
+    # bracketed qualifiers: (Remastered 2011) [Live at ...] (Radio Edit) ...
+    t = re.sub(r"\s*[\(\[](?:[^)\]]*(?:remaster|remastered|live|bonus|deluxe|"
+               r"single|radio edit|edit|version|mono|stereo|expanded|anniversary|"
+               r"acoustic|session|mix)[^)\]]*)[\)\]]", " ", t, flags=re.IGNORECASE)
+    # dashed qualifiers: "- 2011 Remaster", "- Live Version"
+    t = re.sub(r"\s+-\s+(?:\d{4}\s+)?(?:remaster(?:ed)?|live|single|radio edit|"
+               r"album version|bonus)\b.*$", "", t, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", t).strip(" -–—")
+
+
+def _norm_query_text(text):
+    """ASCII-fold + smart-punctuation normalization for QUERY strings.
+
+    MA's search behaves better on plain ASCII: curly quotes → straight,
+    en/em dashes → hyphen, NFKD diacritic fold (Björk → Bjork). Applied to
+    what we SEND, never to stored data.
+    """
+    if not text:
+        return ""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", text)
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    for a, b in (("\u2019", "'"), ("\u2018", "'"), ("\u201c", '"'),
+                 ("\u201d", '"'), ("\u2013", "-"), ("\u2014", "-"),
+                 ("\u2026", "...")):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _query_strategies(artist, title):
     """Query variants, best-first.
 
@@ -297,17 +337,22 @@ def _query_strategies(artist, title):
     recovery: title-only recovered 22/47 vs 0 with the full list). For
     multi-artist credits, lead with title-only and let _pick_best's artist
     validation do the matching against ANY credited name.
+
+    PR-B (24 Aug 2026): queries are built from the CLEANED title (release
+    qualifiers stripped) and ASCII-normalized text — but the strategies,
+    their order, and _pick_best's validation gates are unchanged.
     """
+    title_q = _clean_title(title)
     primary = artist.split(",")[0].strip()
     multi = len(re.split(r",|&|;", artist)) > 1 if artist else False
     if not artist:
-        return [title]
+        return [_norm_query_text(title_q)[:60]]
     if multi:
         return [
-            f"{primary[:40]} {title[:50]}",   # primary artist + title
-            f"{title[:60]}",                  # title-only fallback
+            _norm_query_text(f"{primary[:40]} {title_q[:50]}"),   # primary + clean title
+            _norm_query_text(title_q)[:60],                       # title-only fallback
         ]
-    return [f"{artist[:40]} {title[:50]}"]
+    return [_norm_query_text(f"{artist[:40]} {title_q[:50]}")]
 
 
 def search_ma(token, artist, title):
@@ -509,8 +554,28 @@ def create_playlist(token, name, uris):
     return pid
 
 
-def add_to_existing(token, pid, uris):
-    """Add URIs to an existing playlist (batches of 25, ≥3s pacing)."""
+def add_to_existing(token, pid, uris, playlist_name=None):
+    """Add URIs to an existing playlist (batches of 25, ≥3s pacing).
+
+    PR-D (24 Aug 2026): optional playlist_name enables a POST-ADD count
+    verification — after all batches are submitted AND MA's add-tasks settle
+    (wait_for_add_tasks), playlist_tracks is re-read and compared against
+    len(uris) *only if the playlist was previously empty of these adds*.
+    Callers that diff before adding (fill mode) should pass their expected
+    total via verify_playlist_count themselves instead. Returns True even on
+    unverifiable runs (no name given / API hiccup) — verification here is
+    belt-and-braces, never a new failure path.
+    """
+    start_count = None
+    if playlist_name:
+        try:
+            tr = _api(token, {"message_id": "a0", "command": "music/playlists/playlist_tracks",
+                              "args": {"item_id": str(pid),
+                                       "provider_instance_id_or_domain": "library"}}, timeout=30)
+            start_count = len(tr) if isinstance(tr, list) else None
+        except Exception:
+            start_count = None
+
     for i in range(0, len(uris), 25):
         batch = uris[i:i + 25]
         try:
@@ -519,6 +584,23 @@ def add_to_existing(token, pid, uris):
         except Exception as e:
             print(f"    ⚠️  Add batch {i // 25 + 1} failed: {e}")
         time.sleep(3.0)
+
+    # PR-D: wait for MA's background tasks, then confirm the count moved.
+    # MA silently no-ops unresolvable/deduped URIs while reporting task success
+    # (the 'The Shaken' incident) — a count check catches that class.
+    if playlist_name:
+        if not wait_for_add_tasks(token, playlist_name):
+            print(f"    ⚠️  Add tasks did not settle in time for id={pid} — count unverified")
+            return True
+        try:
+            end = verify_playlist_count(token, pid)
+            if end >= 0 and start_count is not None:
+                delta = end - start_count
+                mark = "✅" if delta == len(uris) else \
+                       ("⚠️" if delta > 0 else "❌")
+                print(f"    {mark} count check: +{delta} (submitted {len(uris)})")
+        except Exception:
+            pass
     return True
 
 
