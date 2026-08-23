@@ -165,21 +165,25 @@ def _query_strategies(artist, title):
 
 
 def search_ma(token, artist, title):
-    # Try library-only first (fast — local files & shares)
-    result = None
-    match = None
+    """Search MA for artist+title; return (uri, provider_domain, name) or None.
+
+    Tries library-only queries first (fast), then cross-provider. Returns
+    None both for "genuinely not found" AND for failed requests — callers
+    distinguish via the SEARCH_ERRORS / SEARCH_TIMEOUTS counters, which is
+    why those counters must stay accurate (L1).
+    """
+    # Library-only first (fast — local files & shares)
     for query in _query_strategies(artist, title):
         payload = {"message_id": "s", "command": "music/search",
                    "args": {"search_query": query[:90], "media_types": ["track"],
                             "limit": 20, "library_only": True}}
-        result = _do_search(token, payload)
-        match = _pick_best(result, artist, title)
+        match = _pick_best(_do_search(token, payload), artist, title)
         if match:
             return match
 
     # Fall back to cross-provider search (slow — Deezer, Bandcamp, Spotify).
     # limit=20 so multiple providers' copies of the same track show up for
-    # the provider-priority ranking below.
+    # the provider-priority ranking in _pick_best.
     payload = {"message_id": "s2", "command": "music/search",
                "args": {"media_types": ["track"], "limit": 20,
                         "library_only": False}}
@@ -192,7 +196,7 @@ def search_ma(token, artist, title):
         match = _pick_best(result, artist, title)
         if match:
             return match
-    return match
+    return None
 
 
 STOPWORDS = {"the", "and", "feat", "ft", "with", "various", "artists", "artist",
@@ -266,10 +270,9 @@ def _pick_best(result, artist, title):
         if best_prio is None or prio < best_prio or (prio == best_prio and s > bs):
             best, bs, best_prio = t, s, prio
     if best:
-        uri = best.get('uri', '')
-        mappings = best.get('provider_mappings') or [{}]
+        mappings = best.get('provider_mappings') or []
         prov = mappings[0].get('provider_domain', '') if mappings else ''
-        return (uri, prov, best.get('name', '?'))
+        return (best.get('uri', ''), prov, best.get('name', '?'))
     return None
 
 

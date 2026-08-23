@@ -16,20 +16,38 @@ Guarantees:
   - every add/remove phase waits until no pending/running KEXP tasks remain
     (tasks/list poll, not the fixed 300s wait).
 """
-import sys, time, re, json, os, importlib.util
+import sys, time, re, json, os, argparse, importlib.util
 
 sys.path.insert(0, "/root/.hermes/scripts")
 import ma_playlist_lib as mplib
 import dandelion_dash_lib as ddlib
 
-spec = importlib.util.spec_from_file_location("kexp_to_ma", "/root/.hermes/scripts/kexp-to-ma.py")
+spec = importlib.util.spec_from_file_location(
+    "kexp_to_ma",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "kexp-to-ma.py"))
 kexp_to_ma = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kexp_to_ma)
 
 DJ = "Cheryl Waters"
-MONTHS = [("2026-05", "May"), ("2026-06", "June"), ("2026-07", "July")]
 CACHE_DIR = "/root/.hermes/cache"
 token = mplib.get_ma_token()
+
+ap = argparse.ArgumentParser(
+    description="Rebuild KEXP monthly playlists from the true airdate window. "
+                "Months as YYYY-MM args; default = previous month.")
+ap.add_argument("months", nargs="*",
+                help="months to rebuild, YYYY-MM (default: previous month)")
+ap.add_argument("--dj", default=DJ, help=f"show host (default: {DJ})")
+args = ap.parse_args()
+
+now = time.gmtime()
+tot = now.tm_year * 12 + now.tm_mon - 1
+prev = f"{tot // 12:04d}-{tot % 12 + 1:02d}"
+MONTHS = []
+for m in (args.months or [prev]):
+    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", m):
+        ap.error(f"bad month {m!r} — use YYYY-MM (01-12)")
+    MONTHS.append((m, mplib.MONTHS[int(m.split("-")[1])]))
 
 
 def wait_kexp_tasks(max_wait=600):
@@ -61,16 +79,17 @@ if pls is None:
 by_name = {re.sub(r"\s*\(\d+\)\s*$", "", (p.get("name") or "").lower().strip()): p for p in pls}
 
 for month, mname in MONTHS:
-    canonical = f"kexp - {mname} 2026 - {DJ}".lower()
+    y = month.split("-")[0]
+    canonical = f"kexp - {mname} {y} - {args.dj}".lower()
     pl = by_name.get(canonical)
     if not pl:
-        print(f"⏭️  {mname}: playlist not found — skipping")
+        print(f"⏭️  {month}: playlist not found ({canonical!r}) — skipping")
         continue
     pid = str(pl["item_id"])
-    print(f"\n{'═' * 55}\n  {mname} 2026 · pid={pid}\n{'═' * 55}")
+    print(f"\n{'═' * 55}\n  {mname} {y} · pid={pid}\n{'═' * 55}")
 
     # 1. true month tracks (fetch BEFORE any mutation)
-    tracks = kexp_to_ma.kexp_month_tracks(month, dj=DJ)
+    tracks = kexp_to_ma.kexp_month_tracks(month, dj=args.dj)
     if tracks is None:
         print(f"❌ {mname}: KEXP API failure — ABORTING (no mutation)")
         sys.exit(2)
