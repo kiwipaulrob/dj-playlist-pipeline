@@ -147,6 +147,13 @@ def existing_for(month, dj=None, station="dandelion"):
 
     month is 'YYYY-MM'; names use '<Station> - June 2026 - DJ' format.
     Used by the trigger to decide fill-vs-live automatically.
+
+    Fail-loud (23 Aug 2026, same contract as the lib's fetch_all_playlists):
+    returns None when the MA API fails — an empty LIST means genuinely no
+    matching playlists, but [] from all_playlists() on API failure is
+    indistinguishable from "MA down". The trigger must abort on None instead
+    of misreading an outage as "nothing exists" and routing auto mode into
+    create (duplicate risk; --resume still guards the scripts themselves).
     """
     prefix = STATIONS.get(station, STATIONS["dandelion"])["prefix"]
     try:
@@ -156,6 +163,11 @@ def existing_for(month, dj=None, station="dandelion"):
         return []
     want = f"{prefix} - {mon_name} {y} - "
     pls = all_playlists()
+    if not pls and _all_playlists_failed():
+        # all_playlists() collapses API failure to [] — tell "library really
+        # empty" from "MA down" with one cheap limit=1 probe. An outage must
+        # not read as "nothing exists": auto mode would route into create.
+        return None
     out = []
     for p in pls:
         name = (p.get("name") or "")
@@ -165,6 +177,18 @@ def existing_for(month, dj=None, station="dandelion"):
             continue
         out.append(name)
     return out
+
+
+def _all_playlists_failed():
+    """True when the last all_playlists() call returned nothing due to errors.
+
+    all_playlists() breaks its loop silently on a non-list/empty page, which
+    happens both at a clean end-of-list AND on API failure. Probe once with
+    a single-page call: a list response (even []) means MA answered and the
+    library really is empty/stationless; anything else is an outage.
+    """
+    page = ma_call("music/playlists/library_items", {"limit": 1, "offset": 0}, timeout=30)
+    return not isinstance(page, list)
 
 
 def months_with_playlists(station="dandelion"):
