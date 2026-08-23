@@ -149,13 +149,28 @@ def main():
         print(f"  Playlist id={pid}: {len(tracks)} expected, "
               f"{len(tracks) - len(missing)} present, {len(missing)} missing")
         new_uris, t0 = [], time.time()
+        still_missing = []   # (artist, title, reason) — recorded after the loop
+        found_keys = []      # (dj, artist, title) cleared from the store on success
         for i, t in enumerate(missing):
             if i % 10 == 0:
                 print(f"  [hb {time.time()-t0:6.0f}s] {i}/{len(missing)} missing", flush=True)
             m = mplib.search_ma(token, t['artist'], t['title'])
             if m:
                 new_uris.append(m[0])
+                found_keys.append((show_name, t['artist'], t['title']))
+            else:
+                still_missing.append((t['artist'], t['title'],
+                                      mplib.LAST_SEARCH_REASON or "no_match"))
             time.sleep(args.delay)
+        # Feature 1 reconciliation: found → clear from store; still-missing →
+        # upsert (bumps attempts; retryable reasons upgrade the stored one).
+        mplib.clear_unavailable_many("kexp", args.month, found_keys)
+        mplib.record_unavailable_many(
+            "kexp", args.month,
+            [(show_name, a, ti, r) for a, ti, r in still_missing])
+        if found_keys or still_missing:
+            print(f"  ↳ unavailable-store: {len(found_keys)} cleared, "
+                  f"{len(still_missing)} recorded")
         print(f"  → found {len(new_uris)}/{len(missing)}")
         if args.dry_run:
             print(f"  (dry-run) would add {len(new_uris)} to id={pid}")
@@ -177,6 +192,7 @@ def main():
 
     print(f"\n🔍 Searching MA ({len(tracks)} tracks)...")
     uris, found, missing = [], [], []
+    still_missing = []   # (artist, title, reason) — recorded after the loop
     t0 = time.time()
     for i, t in enumerate(tracks):
         if i % 10 == 0:
@@ -187,7 +203,16 @@ def main():
             found.append(f"✅ {t['artist'][:18]:18s} - {t['title'][:35]:35s} ({m[1]})")
         else:
             missing.append(f"❌ {t['artist'][:18]:18s} - {t['title']}")
+            still_missing.append((t['artist'], t['title'],
+                                  mplib.LAST_SEARCH_REASON or "no_match"))
         time.sleep(args.delay)
+    # Feature 1: persist what never matched (durable across runs; fill mode
+    # reconciles this store on later runs).
+    mplib.record_unavailable_many(
+        "kexp", args.month,
+        [(show_name, a, ti, r) for a, ti, r in still_missing])
+    if still_missing:
+        print(f"  ↳ unavailable-store: {len(still_missing)} recorded")
     print(f"\n  ✅ {len(found)}/{len(tracks)} found")
     for line in found[:15]:
         print(f"    {line}")

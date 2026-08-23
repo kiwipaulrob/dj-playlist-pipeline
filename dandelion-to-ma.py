@@ -178,6 +178,8 @@ def main():
             if not missing:
                 continue
             new_uris, new_hits = [], []
+            still_missing = []   # (artist, title, reason)
+            found_keys = []      # (dj, artist, title) cleared from store
             for i, t in enumerate(missing):
                 if i % 10 == 0:
                     print(f"  [hb {time.time()-t_fill:6.0f}s] {dj[:28]:28s} "
@@ -186,7 +188,19 @@ def main():
                 if m:
                     new_uris.append(m[0])
                     new_hits.append(f"✅ {t['artist'][:18]:18s} - {t['title'][:35]:35s} ({m[1]})")
+                    found_keys.append((dj, t['artist'], t['title']))
+                else:
+                    still_missing.append((t['artist'], t['title'],
+                                          mplib.LAST_SEARCH_REASON or "no_match"))
                 time.sleep(args.delay)
+            # Feature 1 reconciliation (per DJ segment): found → clear,
+            # still-missing → upsert with this run's failure reason.
+            mplib.clear_unavailable_many("dandelion", args.month, found_keys)
+            mplib.record_unavailable_many(
+                "dandelion", args.month,
+                [(dj, a, ti, r) for a, ti, r in still_missing])
+            print(f"  ↳ unavailable-store: {len(found_keys)} cleared, "
+                  f"{len(still_missing)} recorded")
             print(f"  → found {len(new_hits)}/{len(missing)}")
             for line in new_hits[:10]:
                 print(f"    {line}")
@@ -225,7 +239,7 @@ def main():
         if args.resume and existing_names and canonical in existing_names:
             print(f"\n  ⏭️  {dj}: playlist exists — skipping (--resume)")
             continue
-        res[dj] = {'uris': [], 'found': [], 'missing': []}
+        res[dj] = {'uris': [], 'found': [], 'missing': [], 'still_missing': []}
         dj_t0 = time.time()
         for i, t in enumerate(tracks):
             # fix A: heartbeat every 10 tracks (newline, not \r — journald-safe)
@@ -240,7 +254,16 @@ def main():
                 found += 1
             else:
                 res[dj]['missing'].append(f"❌ {t['artist'][:18]:18s} - {t['title']}")
+                res[dj]['still_missing'].append(
+                    (t['artist'], t['title'], mplib.LAST_SEARCH_REASON or "no_match"))
             time.sleep(args.delay)
+        # Feature 1: persist this DJ's never-matched tracks (durable across
+        # runs; fill mode reconciles the store on later runs).
+        mplib.record_unavailable_many(
+            "dandelion", args.month,
+            [(dj, a, ti, r) for a, ti, r in res[dj]['still_missing']])
+        if res[dj]['still_missing']:
+            print(f"  ↳ unavailable-store: {len(res[dj]['still_missing'])} recorded for {dj}")
         print(f"  [dj {time.time()-dj_t0:6.0f}s] {dj}: {len(res[dj]['found'])}/{len(tracks)}")
 
     print(f"\n\n  ✅ {found}/{total} found")

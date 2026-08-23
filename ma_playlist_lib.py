@@ -27,6 +27,7 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,123 @@ MA_HOST = "192.168.214.159"
 
 MONTHS = ['', 'January', 'February', 'March', 'April', 'May', 'June',
           'July', 'August', 'September', 'October', 'November', 'December']
+
+# ---- unavailable-tracks store (feature 1, 23 Aug 2026) ----------------------
+# Durable record of radio-tracklist songs that NEVER matched any MA provider
+# at build time. Previously the missing list was console-printed once and lost
+# when the run exited — the dashboard could only see provider chips for tracks
+# that made it INTO playlists, never the ones left behind. Store shape:
+#   { "<station>|<month>|<dj>|<norm_key>": {
+#       artist, title, station, month, dj,
+#       reason: "no_match" (permanent) | "timeout" | "api_error" (retryable),
+#       first_seen, last_seen, attempts } }
+# Reconciliation: fill mode CLEARS an entry when the track is finally found,
+# so the store always reflects "still unavailable as of last touch".
+UNAVAILABLE_FILE = os.environ.get("MA_UNAVAILABLE_FILE",
+                                  "/root/.hermes/data/unavailable-tracks.json")
+_unavail_lock = threading.Lock()
+
+# Why the MOST RECENT search_ma() call failed: None (succeeded, or genuinely
+# not on any provider → "no_match"), "timeout", or "api_error". Each station
+# script is single-threaded around its search loop, so reading this right
+# after search_ma() returns is race-free.
+LAST_SEARCH_REASON = None
+
+
+def load_unavailable():
+    """Whole store as dict (empty on missing file; corrupt file reads as empty)."""
+    try:
+        with open(UNAVAILABLE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"    ⚠️  unavailable-store unreadable ({e}) — treating as empty")
+        return {}
+
+
+def _save_unavailable(store):
+    os.makedirs(os.path.dirname(UNAVAILABLE_FILE), exist_ok=True)
+    tmp = UNAVAILABLE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(store, f, indent=1, sort_keys=True)
+    os.replace(tmp, UNAVAILABLE_FILE)   # atomic — readers never see partial
+
+
+def _modify_unavailable(fn):
+    """Exclusive CROSS-PROCESS read-modify-write of the store.
+
+    Two station runs CAN overlap (the dashboard caps concurrency at 2 but a
+    manual CLI run may still collide). Plain last-writer-wins would silently
+    drop one run's records; flock serialises read-modify-write cycles.
+    """
+    import fcntl
+    lock_path = UNAVAILABLE_FILE + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with _unavail_lock:
+        with open(lock_path, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                store = load_unavailable()
+                fn(store)
+                _save_unavailable(store)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def record_unavailable_many(station, month, entries):
+    """Bulk-upsert unmatched tracks. entries: [(dj, artist, title, reason)].
+
+    Re-recording an existing key bumps attempts/last_seen; a retryable reason
+    on top of a permanent one upgrades it (most recent evidence wins).
+    """
+    if not entries:
+        return
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def mod(s):
+        for dj, artist, title, reason in entries:
+            key = f"{station}|{month}|{dj}|{norm_key(artist, title)}"
+            e = s.get(key)
+            if e:
+                e["last_seen"] = now
+                e["attempts"] = int(e.get("attempts", 0)) + 1
+                if reason != "no_match":
+                    e["reason"] = reason
+            else:
+                s[key] = {"artist": artist, "title": title, "station": station,
+                          "month": month, "dj": dj, "reason": reason,
+                          "first_seen": now, "last_seen": now, "attempts": 1}
+    try:
+        _modify_unavailable(mod)
+    except Exception as e:
+        print(f"    ⚠️  could not record unavailable tracks ({e})")
+
+
+def record_unavailable(station, month, dj, artist, title, reason):
+    """Single-track convenience wrapper."""
+    record_unavailable_many(station, month, [(dj, artist, title, reason)])
+
+
+def clear_unavailable_many(station, month, items):
+    """Bulk-remove entries whose tracks were FOUND on a later fill/run.
+    items: [(dj, artist, title)] — unknown keys are silently ignored."""
+    if not items:
+        return
+
+    def mod(s):
+        for dj, artist, title in items:
+            s.pop(f"{station}|{month}|{dj}|{norm_key(artist, title)}", None)
+    try:
+        _modify_unavailable(mod)
+    except Exception as e:
+        print(f"    ⚠️  could not clear unavailable entries ({e})")
+
+
+def clear_unavailable(station, month, dj, artist, title):
+    """Single-track convenience wrapper."""
+    clear_unavailable_many(station, month, [(dj, artist, title)])
 
 
 def get_ma_token():
@@ -171,7 +289,16 @@ def search_ma(token, artist, title):
     None both for "genuinely not found" AND for failed requests — callers
     distinguish via the SEARCH_ERRORS / SEARCH_TIMEOUTS counters, which is
     why those counters must stay accurate (L1).
+
+    Feature 1 (23 Aug 2026): on a None return, LAST_SEARCH_REASON tells the
+    caller WHY — None (genuinely not on any provider → record as "no_match"),
+    "timeout", or "api_error" (both retryable). Callers read it immediately
+    after the call; the station scripts' search loops are single-threaded.
     """
+    global LAST_SEARCH_REASON
+    # Delta-snapshot the run-global error counters so failure classification
+    # reflects THIS call only (the counters accumulate across the whole run).
+    t0_timeouts, t0_errors = SEARCH_TIMEOUTS, SEARCH_ERRORS
     # Library-only first (fast — local files & shares)
     for query in _query_strategies(artist, title):
         payload = {"message_id": "s", "command": "music/search",
@@ -179,6 +306,7 @@ def search_ma(token, artist, title):
                             "limit": 20, "library_only": True}}
         match = _pick_best(_do_search(token, payload), artist, title)
         if match:
+            LAST_SEARCH_REASON = None
             return match
 
     # Fall back to cross-provider search (slow — Deezer, Bandcamp, Spotify).
@@ -195,7 +323,17 @@ def search_ma(token, artist, title):
             result = _do_search(token, payload)
         match = _pick_best(result, artist, title)
         if match:
+            LAST_SEARCH_REASON = None
             return match
+    # Every strategy exhausted — classify WHY using this call's counter deltas:
+    # timeout wins (transient MA/network trouble → worth re-running fill),
+    # then api_error (same), else genuinely absent from every provider.
+    if SEARCH_TIMEOUTS > t0_timeouts:
+        LAST_SEARCH_REASON = "timeout"
+    elif SEARCH_ERRORS > t0_errors:
+        LAST_SEARCH_REASON = "api_error"
+    else:
+        LAST_SEARCH_REASON = "no_match"
     return None
 
 

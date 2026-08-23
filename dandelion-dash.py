@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dandelion_dash_lib as lib
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ma_playlist_lib as mplib
 
 PORT = int(os.environ.get("DANDELION_DASH_PORT", "9210"))
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dandelion-dash.html")
@@ -106,12 +108,49 @@ def build_status(station):
             "favourites_total": len(lib.get_favourites()[0]),
             "months": snapshot,
             "expected": {},
+            "unavailable": unavailable_summary(station),
             "runs": lib_run_state(),
             "station": station,
         }
         _status_cache["data"][station] = data
         _status_cache["ts"] = now
         return data
+
+
+def unavailable_summary(station):
+    """{month: {dj: {count, tracks: [{artist,title,reason,attempts,last_seen}]}}}.
+
+    Feature 1 (23 Aug 2026): from the shared unavailable-tracks store — the
+    radio-tracklist songs that never matched ANY MA provider at build time.
+    Previously this category was console-only and vanished when the run
+    exited; now it survives in /root/.hermes/data/unavailable-tracks.json and
+    fill-mode runs reconcile it. Grouped per month+DJ so each card can show
+    its own red 'unavailable N' chip. Read straight from disk every status
+    build: the file is small (tens of entries) and writes are rare.
+    """
+    try:
+        store = mplib.load_unavailable()
+    except Exception:
+        return {}
+    out = {}
+    for e in store.values():
+        if e.get("station") != station:
+            continue
+        month, dj = e.get("month"), e.get("dj")
+        if not month or not dj:
+            continue
+        slot = out.setdefault(month, {}).setdefault(dj, {"count": 0, "tracks": []})
+        slot["count"] += 1
+        slot["tracks"].append({
+            "artist": e.get("artist", ""), "title": e.get("title", ""),
+            "reason": e.get("reason", "no_match"),
+            "attempts": e.get("attempts", 1),
+            "last_seen": e.get("last_seen", ""),
+        })
+    for month in out:
+        for dj in out[month]:
+            out[month][dj]["tracks"].sort(key=lambda t: t["artist"].lower())
+    return out
 
 
 def lib_run_state():

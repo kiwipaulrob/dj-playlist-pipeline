@@ -46,12 +46,12 @@ report expected-vs-found.
 
 | File | Purpose |
 |---|---|
-| `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker |
+| `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker, **unavailable-tracks store** (`record_unavailable*`/`clear_unavailable*`) |
 | `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), `--month/--dj/--fill/--resume/--dry-run` |
 | `kexp-to-ma.py` | KEXP station script: airdate-window play walk + client-side episode filtering, same flags |
-| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create) |
+| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create), per-card unavailable summary |
 | `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache, `known_months()`/`months_with_playlists()` (pre-creation support), fail-loud `existing_for()` |
-| `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, "Not built yet" placeholder cards for unbuilt months, trigger form, 30 s polling |
+| `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, red **unavailable** chips with expandable no-provider track lists, "Not built yet" placeholder cards for unbuilt months, trigger form, 30 s polling |
 | `test_pr1_precreate.py` | Test suite: pre-creation expected counts (cache namespaces, persistence, None-total semantics); accepts an optional variant arg (`python3 test_pr1_precreate.py pr1`) to run against standalone branch variants |
 | `test_pr2_existing.py` | Test suite: `existing_for()` outage disambiguation + trigger 503/routing; installs a tripwire so any unmocked `launch_run` fails loudly instead of spawning real runs |
 | `test_pr3_cosmetic.py` | Test suite: `search_ma` phases, `_pick_best` guards, `kexp-rebuild-months` argparse |
@@ -81,13 +81,40 @@ aborts the run instead of burning its full timeout budget per remaining track.
 Typical match rate: ~85–95% depending on how obscure the programming is; the rest
 are genuinely absent from every connected provider.
 
+## Unavailable tracks (no provider)
+
+Tracks that never match any provider are not just printed and forgotten — they are
+recorded to a durable store at `~/.hermes/data/unavailable-tracks.json`, keyed by
+`station|month|dj|artist|title`. Each entry keeps:
+
+- **`reason`** — why it's unavailable:
+  - `no_match` — genuinely absent from every connected provider (permanent);
+  - `timeout` / `api_error` — MA or network trouble during the search (retryable;
+    a later fill usually resolves these).
+- **`attempts` / `first_seen` / `last_seen`** — how often and how recently a build
+  tried and failed to place the track.
+
+Lifecycle/reconciliation:
+
+- **LIVE builds** upsert every never-matched track into the store.
+- **FILL runs** reconcile it: tracks that finally matched are **removed**; tracks
+  still missing get their `attempts` bumped and a retryable reason **upgrades** a
+  permanent one (most recent evidence wins).
+- Writes are serialized across concurrent runs (`flock`) and atomic on disk
+  (tmp-file + rename), so overlapping station runs can't drop each other's records.
+
+The dashboard surfaces this per card: a red **⚠ unavailable N ▾** chip that expands
+to the full track list with colour-coded reason badges (red = permanent `no_match`,
+amber = retryable timeout/api error) and attempt counts. The status payload exposes
+the same data as `unavailable[month][dj]`.
+
 ## The dashboard
 
 `GET /` serves the SPA; data endpoints:
 
 | Endpoint | What it does |
 |---|---|
-| `GET /api/status?station=dandelion\|kexp` | Months → shows with tracks / liked / expected counts + provider breakdown (cached 90 s; expected counts scraped in background threads, cached 1 h in memory + persisted to disk across restarts) |
+| `GET /api/status?station=dandelion\|kexp` | Months → shows with tracks / liked / expected counts + provider breakdown + per-DJ unavailable summary (cached 90 s; expected counts scraped in background threads, cached 1 h in memory + persisted to disk across restarts) |
 | `GET /api/options?station=…` | Chooser data: Dandelion DJ list from playlist names; KEXP all 41 programs + 106 hosts (cached 6 h) |
 | `POST /api/trigger` | `{station, month, dj?, mode}` — launches the station script in its **own transient systemd unit** (`systemd-run --collect --wait`), logs to `~/.hermes/data/dandelion-runs/`, records a JSON run entry watched by a monitor thread. Modes: `auto` (fill if any playlist exists else create), `fill`, `live`, `dry`. **Fail-loud routing:** when `existing_for()` cannot reach MA it aborts with HTTP 503 instead of misreading the outage as "nothing exists". Hard cap: 2 concurrent runs (matches MA's 2-slot task queue) → HTTP 429 beyond that |
 | `GET /api/runs` | Last 10 run records; zombie `running` entries whose unit died get reconciled to `died` automatically (reconciler window = lexicographic top-10 of the runs dir) |
@@ -184,6 +211,10 @@ buffer, the fill pass mops up. Cron budgets need ≥7200 s — a full Dandelion 
 - **Expected-vs-found honesty:** the dashboard scrapes real per-month/per-show
   expected counts, so a card showing 45% means the playlist really is partial —
   run fill mode rather than guessing.
+- **Unavailable ≠ lost.** A track missing from a playlist is either in the
+  unavailable store (check the card's red chip for its reason) or genuinely absent
+  from every provider. Timeouts recorded there are exactly what the monthly fill
+  pass retries — the store and the fill reconcile each other.
 
 ## Maintenance tools
 
