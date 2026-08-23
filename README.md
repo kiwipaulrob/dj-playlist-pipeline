@@ -49,10 +49,13 @@ report expected-vs-found.
 | `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker |
 | `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), `--month/--dj/--fill/--resume/--dry-run` |
 | `kexp-to-ma.py` | KEXP station script: airdate-window play walk + client-side episode filtering, same flags |
-| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, run launcher + reconciler |
-| `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache |
-| `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, trigger form, 30 s polling |
-| `kexp-rebuild-months.py` | One-off maintenance tool: deterministic remove-all → re-add rebuild of existing KEXP months (favourites-safe, fail-loud ordering) |
+| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create) |
+| `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache, `known_months()`/`months_with_playlists()` (pre-creation support), fail-loud `existing_for()` |
+| `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, "Not built yet" placeholder cards for unbuilt months, trigger form, 30 s polling |
+| `test_pr1_precreate.py` | Test suite: pre-creation expected counts (cache namespaces, persistence, None-total semantics); accepts an optional variant arg (`python3 test_pr1_precreate.py pr1`) to run against standalone branch variants |
+| `test_pr2_existing.py` | Test suite: `existing_for()` outage disambiguation + trigger 503/routing; installs a tripwire so any unmocked `launch_run` fails loudly instead of spawning real runs |
+| `test_pr3_cosmetic.py` | Test suite: `search_ma` phases, `_pick_best` guards, `kexp-rebuild-months` argparse |
+| `kexp-rebuild-months.py` | Maintenance tool: deterministic remove-all → re-add rebuild of existing KEXP months (favourites-safe, fail-loud ordering). Months are CLI args now: `kexp-rebuild-months.py 2026-05 2026-06 [--dj "Cheryl Waters"]` (default: previous month) |
 | `dandelion-cron.sh` / `kexp-cron.sh` | Monthly cron wrappers (2nd, previous month, `--resume`) |
 | `dandelion-fill-cron.sh` / `kexp-fill-cron.sh` | Monthly fill wrappers (3rd, catches late matches) |
 
@@ -86,8 +89,19 @@ are genuinely absent from every connected provider.
 |---|---|
 | `GET /api/status?station=dandelion\|kexp` | Months → shows with tracks / liked / expected counts + provider breakdown (cached 90 s; expected counts scraped in background threads, cached 1 h in memory + persisted to disk across restarts) |
 | `GET /api/options?station=…` | Chooser data: Dandelion DJ list from playlist names; KEXP all 41 programs + 106 hosts (cached 6 h) |
-| `POST /api/trigger` | `{station, month, dj?, mode}` — launches the station script in its **own transient systemd unit** (`systemd-run --collect --wait`), logs to `~/.hermes/data/dandelion-runs/`, records a JSON run entry watched by a monitor thread. Modes: `auto` (fill if any playlist exists else create), `fill`, `live`, `dry`. Hard cap: 2 concurrent runs (matches MA's 2-slot task queue) → HTTP 429 beyond that |
-| `GET /api/runs` | Last 10 run records; zombie `running` entries whose unit died get reconciled to `died` automatically |
+| `POST /api/trigger` | `{station, month, dj?, mode}` — launches the station script in its **own transient systemd unit** (`systemd-run --collect --wait`), logs to `~/.hermes/data/dandelion-runs/`, records a JSON run entry watched by a monitor thread. Modes: `auto` (fill if any playlist exists else create), `fill`, `live`, `dry`. **Fail-loud routing:** when `existing_for()` cannot reach MA it aborts with HTTP 503 instead of misreading the outage as "nothing exists". Hard cap: 2 concurrent runs (matches MA's 2-slot task queue) → HTTP 429 beyond that |
+| `GET /api/runs` | Last 10 run records; zombie `running` entries whose unit died get reconciled to `died` automatically (reconciler window = lexicographic top-10 of the runs dir) |
+
+### Pre-creation expected counts
+
+Months where the **station source** has data but no MA playlist exists yet are no
+longer invisible. `/api/status` attaches a `__precreate__` entry for them
+(known via `lib.known_months()`: dandelion = months already in the expected-count
+cache, kexp = current + previous month); the frontend renders a "Not built yet"
+placeholder card with the expected total instead of an empty grid. Totals are
+cached under `<station>-precreate:<month>` keys — only real totals; while the
+underlying scrape is still running the card shows "counting…" and retries on the
+next poll.
 
 The site reflects MA edits within ~2 minutes (30 s frontend polling + 90 s server
 cache) — there is no static regeneration step. Deleting/reordering tracks in the MA
@@ -163,7 +177,9 @@ buffer, the fill pass mops up. Cron budgets need ≥7200 s — a full Dandelion 
   `playlist_tracks`.
 - **Fail-loud everywhere:** every list-fetch returns `None` on API failure and
   callers exit non-zero. A silent empty set once created 20 duplicate playlists in
-  one night; that class of bug is engineered out, not handled.
+  one night; that class of bug is engineered out, not handled. This includes
+  `existing_for()`: an MA outage during a trigger returns `None` → HTTP 503,
+  never `[]` masquerading as "nothing to fill".
 - **Never trust `count` fields** on KEXP paginated endpoints; page until a short page.
 - **Expected-vs-found honesty:** the dashboard scrapes real per-month/per-show
   expected counts, so a card showing 45% means the playlist really is partial —
