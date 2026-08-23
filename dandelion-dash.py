@@ -85,11 +85,13 @@ def _save_expected_disk():
     # L1 (15 Aug 2026): serialize the payload under _cache_lock so a
     # concurrent scrape's store can't interleave mid-iteration (was a
     # swallowed RuntimeError -> occasional missed persistence).
+    # PR4 (24 Aug 2026): atomic tmp+replace write — concurrent readers
+    # (restart-time _load_expected_disk, external tooling) never see a
+    # truncated file; two scrape threads can no longer interleave writes.
     try:
         with _cache_lock:
-            payload = json.dumps({"data": _expected_cache["data"]})
-        with open(lib.CACHE_FILE, "w") as f:
-            f.write(payload)
+            data = {"data": _expected_cache["data"]}
+        mplib.atomic_write_json(lib.CACHE_FILE, data)
     except Exception:
         pass
 
@@ -173,8 +175,8 @@ def lib_run_state():
                             if chk.stdout.strip() not in ("active", "activating", "deactivating"):
                                 r["status"] = "died"
                                 r["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                                with open(os.path.join(lib.RUNS_DIR, f), "w") as fh2:
-                                    json.dump(r, fh2)
+                                # PR4: atomic — /api/runs readers never see a torn record
+                                mplib.atomic_write_json(os.path.join(lib.RUNS_DIR, f), r)
                         except Exception:
                             pass
                     runs.append(r)
@@ -297,8 +299,8 @@ def launch_run(station, month, dj=None, dry_run=False, fill=False, resume=True):
            "dry_run": dry_run, "fill": fill,
            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "status": "running",
            "log": log, "pid": None}
-    with open(os.path.join(lib.RUNS_DIR, f"{run_id}.json"), "w") as f:
-        json.dump(rec, f)
+    # PR4: atomic — the /api/runs poller can list this dir the instant we return
+    mplib.atomic_write_json(os.path.join(lib.RUNS_DIR, f"{run_id}.json"), rec)
 
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           STATION_SCRIPT.get(station, "dandelion-to-ma.py"))
@@ -335,8 +337,8 @@ def launch_run(station, month, dj=None, dry_run=False, fill=False, resume=True):
                 r = json.load(f)
             r["status"] = st
             r["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            with open(rec_path, "w") as f:
-                json.dump(r, f)
+            # PR4: atomic — concurrent /api/runs reads never see the torn state
+            mplib.atomic_write_json(rec_path, r)
         except Exception:
             pass
     threading.Thread(target=_watch, args=(proc, os.path.join(lib.RUNS_DIR, f"{run_id}.json")),
