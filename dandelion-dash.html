@@ -194,6 +194,22 @@ function renderTabs(months) {
 function renderGrid() {
   const shows = DATA.months[curMonth] || {};
   const exp = (DATA.expected || {})[curMonth] || {};
+  // Pre-creation month (PR: expected-before-create): the station source has
+  // data for this month but no MA playlists exist yet — render a build-me
+  // placeholder card with the expected total instead of an empty grid.
+  if (exp.__precreate__) {
+    const tot = exp.total != null ? exp.total : '?';
+    document.getElementById('grid').innerHTML = `
+      <div class="card">
+        <div class="dj">Not built yet</div>
+        <div class="meta">${escapeHtml(curMonth)} · no playlist in MA for this month yet</div>
+        <div class="bar"><div style="width:0%"></div></div>
+        <div class="row"><span>expected ${tot} tracks (from ${station === 'kexp' ? 'KEXP API' : 'site tracklist'})</span>
+          <span>${tot === '?' ? 'counting…' : 'ready to build'}</span></div>
+        <div class="row"><span>pick a mode above and trigger a run</span><span></span></div>
+      </div>`;
+    return;
+  }
   const keys = Object.keys(shows).sort();
   if (!keys.length) { document.getElementById('grid').innerHTML = '<div class="sub">no playlists for this month</div>'; return; }
   document.getElementById('grid').innerHTML = keys.map(dj => {

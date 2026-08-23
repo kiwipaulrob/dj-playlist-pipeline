@@ -167,6 +167,33 @@ def existing_for(month, dj=None, station="dandelion"):
     return out
 
 
+def months_with_playlists(station="dandelion"):
+    """Set of 'YYYY-MM' months that have at least one station playlist.
+
+    Single paginated pass over the library (same fetch playlist_snapshot
+    uses). Returns set() on API failure — callers must treat that as
+    "cannot determine", never as proof a month is empty.
+    """
+    prefix = STATIONS.get(station, STATIONS["dandelion"])["prefix"]
+    pls = all_playlists()
+    if not pls:
+        return set()
+    months = set()
+    for p in pls:
+        name = p.get("name", "") or ""
+        if not name.startswith(prefix + " - "):
+            continue
+        m = re.match(rf"{re.escape(prefix)} - ([A-Za-z]+) (\d{{4}}) - ", name)
+        if not m:
+            continue
+        try:
+            mi = MONTH_NAMES.index(m.group(1))
+        except ValueError:
+            continue
+        months.add(f"{m.group(2)}-{mi:02d}")
+    return months
+
+
 def playlist_snapshot(station="dandelion"):
     """Return {month: {dj_name: {id, name, tracks, liked, providers, month, year}}}."""
     prefix = STATIONS.get(station, STATIONS["dandelion"])["prefix"]
@@ -401,6 +428,45 @@ def kexp_options():
     hosts = fetch_all("hosts", "name")
     _kexp_opts_cache.update(ts=now, programs=programs, hosts=hosts)
     return programs, hosts
+
+
+def known_months(station="dandelion"):
+    """Months the STATION SOURCE has data for — regardless of MA playlists.
+
+    This is what makes pre-creation expected counts possible (23 Aug 2026):
+    a month with no MA playlists never appears in playlist_snapshot, so the
+    dashboard had nothing to attach an expected count to until AFTER the
+    first build. Sources, cheapest-first:
+      - dandelion: months already scraped into the expected-count cache
+        (the scrape itself is triggered by the dashboard for months it
+        knows about; keys are 'dandelion:YYYY-MM[...]').
+      - kexp: always the current + previous month (24/7 station — data
+        exists for every month; no scrape needed to know that).
+    Returns a set of 'YYYY-MM'. Never touches the network.
+    """
+    months = set()
+    if station == "kexp":
+        today = time.gmtime()
+        y, m = today.tm_year, today.tm_mon
+        for delta in (0, 1):  # current month, previous month
+            tot = y * 12 + (m - 1) - delta
+            months.add(f"{tot // 12:04d}-{tot % 12 + 1:02d}")
+        return months
+    pref = f"{station}:"
+    for key in _EXPECTED_KEYS_PROVIDER():
+        if key.startswith(pref):
+            parts = key.split(":")
+            if len(parts) >= 2 and re.match(r"^\d{4}-\d{2}$", parts[1]):
+                months.add(parts[1])
+    return months
+
+
+# Set by dandelion-dash.py at import time: a zero-arg callable returning the
+# current expected-cache keys. The lib can't import the dash module back
+# (hyphen filename, run-as-script) — dependency injection instead. Standalone
+# consumers (station scripts importing this lib directly) get an empty
+# snapshot, which is correct: they never populate that cache.
+_EXPECTED_KEYS_PROVIDER = list
 
 
 def station_djs(station="dandelion"):

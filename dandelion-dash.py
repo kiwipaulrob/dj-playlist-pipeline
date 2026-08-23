@@ -40,6 +40,11 @@ _expected_cache = {"data": {}}
 _expected_locks = {}
 _cache_lock = threading.Lock()   # guards _expected_cache["data"] during disk saves (L1)
 
+# Pre-creation expected counts (23 Aug 2026): lib.known_months("dandelion")
+# discovers months from THIS cache. The lib cannot import this module back
+# (hyphen filename, run-as-script) — hand it a live key snapshot instead.
+lib._EXPECTED_KEYS_PROVIDER = lambda: list(_expected_cache["data"].keys())
+
 STATION_SCRIPT = {
     "dandelion": "dandelion-to-ma.py",
     "kexp": "kexp-to-ma.py",
@@ -65,6 +70,8 @@ def _load_expected_disk():
                 conv[k] = {"ts": time.time(), "value": v}
         # Per-segment keying (row s): drop legacy month-only kexp keys
         # ("kexp:YYYY-MM") — never looked up again, would linger forever.
+        # (Pre-creation totals, 23 Aug 2026, live under "<station>-precreate:
+        # <month>" — a different prefix, so this filter never touches them.)
         conv = {k: v for k, v in conv.items()
                 if not (k.startswith("kexp:") and k.count(":") == 1)}
         _expected_cache["data"] = conv
@@ -298,7 +305,7 @@ def launch_run(station, month, dj=None, dry_run=False, fill=False, resume=True):
     return rec
 
 
-def fill_expected(data, station):
+def fill_expected(data, station, known_months=None):
     """Attach per-card expected counts to a status payload (row s, 15 Aug 2026).
 
     Expected counts are keyed by the SAME segment the cards use, so the
@@ -311,6 +318,14 @@ def fill_expected(data, station):
       - Dandelion: one month-wide {dj: count} dict, plus a fuzzy fallback
         (_fuzzy_dj_match) for cards whose name segment is a partial of the
         site header ("Mark Whitby" card -> "Mark Whitby on FSK" count).
+
+    Pre-creation expected counts (23 Aug 2026): `data["months"]` only ever
+    contains months that ALREADY have MA playlists — fill_expected iterates
+    it, so a new month's cards could never show "expected N" before the
+    first build. `known_months` (from lib.known_months) lists months the
+    STATION SOURCE has data for; for any of those missing from the payload,
+    a "__precreate__" entry is attached so the frontend can render a
+    build-me placeholder with its expected total.
 
     L3 (15 Aug 2026): returns a SHALLOW COPY of the payload with a fresh
     "expected" dict — the object build_status caches is never mutated, so
@@ -332,6 +347,51 @@ def fill_expected(data, station):
                     if m:
                         exp[segment] = exp[m]
         out["expected"][month] = exp
+
+    # Pre-creation months: station source has data, no playlists exist yet.
+    # Totals are cached under their own key namespace — "<station>-precreate:
+    # <month>" — NOT the bare "station:month" keys, which for kexp collide
+    # with legacy {dj: count} entries that _load_expected_disk must keep
+    # pruning. get_expected handles persistence + TTL + locking; only the
+    # value shape differs ({__total__: n} instead of {dj: count}).
+    if known_months:
+        have = data.get("months") or {}
+        for month in sorted(known_months):
+            if month in have:
+                continue
+
+            def _precreate_value():
+                if station == "kexp":
+                    v = get_expected("kexp", month,
+                                     show="Cheryl Waters")  # default show until built
+                    total = (v or {}).get("Cheryl Waters")
+                else:
+                    total = sum((get_expected(station, month) or {}).values()) or None
+                return {"__precreate__": True, "total": total or None}
+
+            pc_key = f"{station}-precreate:{month}"
+            now2 = time.time()
+            entry = _expected_cache["data"].get(pc_key)
+            if entry and now2 - entry["ts"] < SCRAPE_TTL:
+                out["expected"][month] = entry["value"]
+                continue
+            lock = _expected_locks.setdefault(pc_key, threading.Lock())
+            if lock.locked():
+                out["expected"][month] = {"__precreate__": True, "total": None}
+                continue
+            with lock:
+                val = _precreate_value()
+                out["expected"][month] = val
+                # M1 semantics: cache only REAL totals. A None total means the
+                # underlying scrape hasn't landed yet (get_expected scrapes in
+                # a background thread and returns {}) — caching that pinned
+                # "counting…" for a full hour. Leave uncached; the next
+                # status poll recomputes and finds it once the scrape lands.
+                if val.get("total") is not None:
+                    with _cache_lock:
+                        _expected_cache["data"][pc_key] = {"ts": time.time(),
+                                                           "value": val}
+                    _save_expected_disk()
     return out
 
 
@@ -376,7 +436,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
         elif path.startswith("/api/status"):
             station = query.get("station", "dandelion")
-            data = fill_expected(build_status(station), station)
+            data = fill_expected(build_status(station), station,
+                                 known_months=lib.known_months(station))
             self._send(200, json.dumps(data).encode())
         elif path.startswith("/api/options"):
             station = query.get("station", "dandelion")
