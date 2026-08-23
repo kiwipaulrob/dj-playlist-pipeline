@@ -355,6 +355,7 @@ def kexp_play_walk(month, show_ids=None, max_pages=100):
     before = f"{int(y) + 1}-01-01T00:00:00-07:00" if m == "12" \
         else f"{y}-{int(m) + 1:02d}-01T00:00:00-07:00"
     out, offset, pages = [], 0, 0
+    _last, last_ts = None, None   # PR-C consecutive-spin dedupe state
     while pages < max_pages:
         try:
             d = _kexp_get(
@@ -381,7 +382,24 @@ def kexp_play_walk(month, show_ids=None, max_pages=100):
             title = (p.get("song") or "").strip()
             if not artist or not title:
                 continue
+            # PR-C (24 Aug 2026): consecutive-spin dedupe — KEXP sometimes logs
+            # the same song twice within minutes (double-spin / re-cue). The
+            # global artist|title dedupe downstream already collapses these,
+            # so this only needs to catch CONSECUTIVE repeats cheaply: same
+            # normalized pair AND <10 min since the previous log. Airedate is
+            # truncated to the minute (API precision), hence <=600s.
+            key = (artist.lower(), title.lower())
+            try:
+                ad = p.get("airdate") or ""
+                ts = time.mktime(time.strptime(ad[:16], "%Y-%m-%dT%H:%M"))
+            except ValueError:
+                ts = None
+            if key == _last and ts is not None and last_ts is not None \
+                    and abs(ts - last_ts) <= 600:
+                last_ts = ts          # extend the repeat window
+                continue
             out.append((artist, title))
+            _last, last_ts = key, ts
         if len(res) < 1000:
             break
         offset += 1000
