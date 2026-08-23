@@ -146,6 +146,14 @@ def main():
     for dj, tr in sorted(sections.items()):
         m_ = ' ▶' if (not args.dj or args.dj.lower() in dj.lower()) else '  '
         print(f"   {m_} {dj}: {len(tr)} tracks")
+        # PR-C (24 Aug 2026): early tripwire for site-layout drift — a DJ
+        # section that parsed but yielded <3 tracks almost always means the
+        # page structure changed mid-table (or a partial publish), not a
+        # genuinely 2-track show. Warn loudly; the run continues (fail-soft)
+        # because LIVE mode already refuses to touch --resume'd playlists.
+        if len(tr) < 3:
+            print(f"      ⚠️  LOW TRACK COUNT for {dj!r} ({len(tr)}) — "
+                  f"possible tracklist page layout change; verify before trusting")
 
     if args.dj:
         sections = {k: v for k, v in sections.items() if args.dj.lower() in k.lower()}
