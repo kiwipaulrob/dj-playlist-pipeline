@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DJs — Radio Playlist Dashboard</title>
+<link rel="icon" id="favicon" href="/static/dandelion-favicon.ico" type="image/x-icon">
+<style>
+:root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+        --ok:#3fb950; --warn:#d29922; --bad:#f85149; --acc:#58a6ff; --heart:#f85149; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,sans-serif; padding:24px; }
+h1 { font-size:20px; margin-bottom:4px; }
+.sub { color:var(--muted); font-size:12px; margin-bottom:16px; }
+.stationbar { display:flex; align-items:center; gap:16px; margin-bottom:14px;
+              background:var(--card); border:1px solid var(--border); border-radius:12px; padding:12px 16px; }
+.stationlogo { height:48px; width:auto; max-width:220px; object-fit:contain;
+               border:1px solid var(--border); border-radius:8px;
+               background:#fff; padding:6px 10px; }
+.stationinfo h2 { font-size:18px; }
+.stationinfo .tag { color:var(--muted); font-size:12px; }
+.stattabs { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+.stattab { background:var(--card); border:1px solid var(--border); color:var(--fg);
+           padding:8px 16px; border-radius:20px; cursor:pointer; font-size:14px; }
+.stattab.on { background:var(--acc); border-color:var(--acc); color:#0d1117; font-weight:600; }
+.badges { display:flex; gap:10px; margin-bottom:18px; flex-wrap:wrap; }
+.badge { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:8px 14px; }
+.badge b { font-size:18px; }
+.tabs { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+.tab { background:var(--card); border:1px solid var(--border); color:var(--fg);
+       padding:6px 14px; border-radius:20px; cursor:pointer; }
+.tab.on { background:var(--acc); border-color:var(--acc); color:#0d1117; font-weight:600; }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+.card .dj { font-weight:600; margin-bottom:2px; }
+.malink { font-size:11px; font-weight:500; color:var(--acc); text-decoration:none;
+         margin-left:8px; border:1px solid var(--border); border-radius:4px; padding:1px 6px; }
+.malink:hover { background:var(--acc); color:#0d1117; }
+.card .meta { color:var(--muted); font-size:12px; margin-bottom:8px; }
+.bar { background:#21262d; border-radius:6px; height:8px; overflow:hidden; margin:6px 0 8px; }
+.bar > div { background:var(--ok); height:100%; }
+.bar.warn > div { background:var(--warn); }
+.bar.bad > div { background:var(--bad); }
+.row { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+.liked { color:var(--heart); font-weight:600; }
+.provs { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
+.prov { font-size:11px; background:#21262d; border:1px solid var(--border);
+        border-radius:10px; padding:1px 8px; color:var(--muted); }
+.prov b { color:var(--fg); }
+form { background:var(--card); border:1px solid var(--border); border-radius:10px;
+       padding:14px; margin-bottom:20px; display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+form label { font-size:12px; color:var(--muted); display:block; margin-bottom:4px; }
+form input, form select { background:#21262d; border:1px solid var(--border); color:var(--fg);
+       border-radius:6px; padding:7px 10px; font-size:13px; }
+form button { background:var(--acc); border:none; color:#0d1117; font-weight:600;
+       border-radius:6px; padding:8px 16px; cursor:pointer; }
+#msg { font-size:12px; color:var(--muted); margin-top:8px; }
+.runs { margin-top:20px; }
+.runs h2 { font-size:15px; margin-bottom:8px; }
+.runrow { font-size:12px; color:var(--muted); padding:3px 0; border-bottom:1px dashed var(--border); }
+</style>
+</head>
+<body>
+<div class="stattabs" id="stattabs"></div>
+
+<div class="stationbar" id="stationbar"></div>
+<div class="sub" id="generated">loading…</div>
+
+<div class="badges" id="badges"></div>
+
+<form id="trig">
+  <div><label>Month</label><input id="t-month" type="month" required></div>
+  <div style="width:260px"><label id="t-dj-label">DJ / Show (optional)</label>
+    <select id="t-dj"><option value="">— all —</option></select>
+  </div>
+  <div><label>Mode</label>
+    <select id="t-mode">
+      <option value="auto">Auto (fill if exists, create if new)</option>
+      <option value="fill">Fill existing (no new)</option>
+      <option value="live">Create new (force)</option>
+      <option value="dry">Dry-run (test only)</option>
+    </select>
+  </div>
+  <button type="submit">▶ Trigger run</button>
+</form>
+<div id="msg"></div>
+
+<div class="tabs" id="tabs"></div>
+<div class="grid" id="grid"><div class="sub">loading…</div></div>
+
+<div class="runs"><h2>Recent runs</h2><div id="runs"></div></div>
+
+<script>
+const STATIONS = [
+  { id:'dandelion', name:'Dandelion Radio', tag:'UK online radio · monthly DJ shows',
+    logo:'/static/dandelion-logo.jpg', favicon:'/static/dandelion-favicon.ico' },
+  { id:'kexp', name:'KEXP', tag:'Seattle · public radio',
+    logo:'/static/kexp-logo.svg', favicon:'/static/kexp-favicon.png' },
+];
+let DATA = null, curMonth = null, station = 'dandelion';
+let OPTIONS = {shows: [], djs: []};
+
+async function loadOptions() {
+  try {
+    const r = await fetch('/api/options?station=' + station);
+    OPTIONS = await r.json();
+  } catch (e) { OPTIONS = {shows: [], djs: []}; }
+  const sel = document.getElementById('t-dj');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">— all —</option>';
+  if (station === 'kexp' && OPTIONS.shows && OPTIONS.shows.length) {
+    const og = document.createElement('optgroup');
+    og.label = 'All shows';
+    OPTIONS.shows.forEach(s => {
+      const o = document.createElement('option');
+      o.value = s; o.textContent = s; og.appendChild(o);
+    });
+    sel.appendChild(og);
+  }
+  const og2 = document.createElement('optgroup');
+  og2.label = station === 'kexp' ? 'All DJs' : 'All DJs';
+  (OPTIONS.djs || []).forEach(d => {
+    const o = document.createElement('option');
+    o.value = d; o.textContent = d; og2.appendChild(o);
+  });
+  sel.appendChild(og2);
+  if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  sel.onchange = () => renderStationBar();
+  document.getElementById('t-dj-label').textContent =
+    station === 'kexp' ? 'Show / DJ (optional)' : 'DJ (optional)';
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/status?station=' + station);
+    DATA = await r.json();
+  } catch (e) { document.getElementById('grid').textContent = 'status API unreachable'; return; }
+  document.getElementById('generated').textContent =
+    'Updated ' + DATA.generated + ' · ' + DATA.favourites_total + ' liked songs in MA library';
+  const months = Object.keys(DATA.months || {}).sort().reverse();
+  if (!curMonth && months.length) curMonth = months[0];
+  renderStationBar(); renderBadges(months); renderTabs(months); renderGrid(); renderRuns();
+}
+
+function renderStationBar() {
+  const st = STATIONS.find(s => s.id === station);
+  const sel = document.getElementById('t-dj');
+  const picked = sel && sel.value ? sel.value : null;
+  const sub = station === 'kexp'
+    ? (picked ? 'Seattle · ' + picked : 'Seattle · public radio · The Midday Show default')
+    : st.tag;
+  document.getElementById('stationbar').innerHTML =
+    `<img class="stationlogo" src="${st.logo}" alt="${st.name}" onerror="this.style.display='none'">` +
+    `<div class="stationinfo"><h2>${st.name}${picked ? ' — ' + picked : ''}</h2><div class="tag">${sub}</div></div>`;
+  // swap the browser-tab favicon to the active station's
+  const fav = document.getElementById('favicon');
+  if (fav && st.favicon) {
+    fav.href = st.favicon;
+    fav.type = st.favicon.endsWith('.png') ? 'image/png' : 'image/x-icon';
+  }
+  document.title = (picked && station === 'kexp' ? st.name + ' — ' + picked : st.name) +
+    ' — Playlist Dashboard';
+}
+
+function renderStatTabs() {
+  document.getElementById('stattabs').innerHTML = STATIONS.map(s =>
+    `<div class="stattab ${s.id===station?'on':''}" data-s="${s.id}">${s.name}</div>`).join('');
+  document.querySelectorAll('.stattab').forEach(t =>
+    t.onclick = () => { station = t.dataset.s; curMonth = null;
+      renderStatTabs(); document.getElementById('grid').innerHTML = '<div class="sub">loading…</div>';
+      loadOptions(); load(); });
+}
+
+function renderBadges(months) {
+  let npl = 0, ntr = 0, nlk = 0;
+  for (const m of Object.keys(DATA.months || {}))
+    for (const dj of Object.values(DATA.months[m])) {
+      npl++; if (dj.tracks > 0) ntr += dj.tracks; if (dj.liked > 0) nlk += dj.liked;
+    }
+  document.getElementById('badges').innerHTML =
+    `<div class="badge">Playlists <b>${npl}</b></div>` +
+    `<div class="badge">Tracks in MA <b>${ntr}</b></div>` +
+    `<div class="badge"><span class="liked">♥ liked</span> <b>${nlk}</b></div>` +
+    `<div class="badge">Months <b>${months.length}</b></div>`;
+}
+
+function renderTabs(months) {
+  document.getElementById('tabs').innerHTML = months.map(m =>
+    `<div class="tab ${m===curMonth?'on':''}" data-m="${m}">${m}</div>`).join('');
+  document.querySelectorAll('.tab').forEach(t =>
+    t.onclick = () => { curMonth = t.dataset.m; renderTabs(months); renderGrid(); });
+}
+
+function renderGrid() {
+  const shows = DATA.months[curMonth] || {};
+  const exp = (DATA.expected || {})[curMonth] || {};
+  const keys = Object.keys(shows).sort();
+  if (!keys.length) { document.getElementById('grid').innerHTML = '<div class="sub">no playlists for this month</div>'; return; }
+  document.getElementById('grid').innerHTML = keys.map(dj => {
+    const s = shows[dj];
+    const expected = exp[dj] || null;
+    const have = s.tracks >= 0 ? s.tracks : null;
+    const pct = (expected && have != null) ? Math.round(100 * have / expected) : null;
+    const barCls = pct == null ? '' : (pct >= 90 ? '' : pct >= 50 ? 'warn' : 'bad');
+    const stat = pct == null ? (have == null ? '?' : have + ' tr') :
+                 (pct >= 90 ? '✅ ' + pct + '%' : pct >= 50 ? '⚠️ ' + pct + '%' : '❌ ' + pct + '%');
+    const barW = pct == null ? (have == null ? 0 : Math.min(100, have * 2)) : pct;
+    const provs = Object.entries(s.providers || {});
+    const provHtml = provs.length
+      ? '<div class="provs">' + provs.slice(0, 5).map(([p, n]) =>
+          `<span class="prov">${escapeHtml(p)} <b>${n}</b></span>`).join('') +
+        (provs.length > 5 ? `<span class="prov">+${provs.length - 5} more</span>` : '') + '</div>'
+      : '';
+    return `<div class="card">
+      <div class="dj">${escapeHtml(dj)}
+        <a class="malink" target="_blank" rel="noopener"
+           href="https://music.robertsons.cloud/#/playlists/library/${s.id}"
+           title="Open in Music Assistant">↗ MA</a></div>
+      <div class="meta">${s.name} · id ${s.id}</div>
+      <div class="bar ${barCls}"><div style="width:${Math.min(100,barW)}%"></div></div>
+      <div class="row"><span>expected ${expected ?? '?'} · found ${have ?? '?'}</span>
+        <span>${stat}</span></div>
+      <div class="row"><span>${s.tracks >= 0 ? 'in MA playlist: ' + s.tracks : 'not yet in MA'}</span>
+        <span class="liked">${s.liked > 0 ? '♥ ' + s.liked + ' liked' : ''}</span></div>
+      ${provHtml}
+    </div>`;
+  }).join('');
+}
+
+function renderRuns() {
+  const runs = (DATA.runs || []).filter(r => !r.station || r.station === station);
+  document.getElementById('runs').innerHTML = runs.length ? runs.map(r =>
+    `<div class="runrow">[${r.started}] ${r.month} · ${r.dj || 'all shows'} · ${r.dry_run ? 'dry' : r.fill ? 'fill' : 'live'} · ${r.status}</div>`
+  ).join('') : '<div class="runrow">no runs yet for this station</div>';
+}
+
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+document.getElementById('trig').onsubmit = async (e) => {
+  e.preventDefault();
+  const month = document.getElementById('t-month').value;
+  const dj = document.getElementById('t-dj').value.trim() || null;
+  const mode = document.getElementById('t-mode').value;
+  const msg = document.getElementById('msg');
+  msg.textContent = 'triggering ' + station + ' ' + month + (dj ? ' · ' + dj : '') + ' (' + mode + ')…';
+  try {
+    const r = await fetch('/api/trigger', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({station, month, dj, mode})});
+    const j = await r.json();
+    if (j.ok) {
+      const m = j.run.mode + (j.run.fill ? ' → fill' : ' → create');
+      msg.textContent = '✅ started: ' + j.run.id + ' (' + m + ', ' +
+        j.run.existing_playlists + ' existing)';
+    } else msg.textContent = '❌ ' + (j.error || 'failed');
+    setTimeout(load, 3000);
+  } catch (err) { msg.textContent = '❌ ' + err; }
+};
+
+renderStatTabs();
+loadOptions();
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

@@ -1,0 +1,182 @@
+# DJ Playlist Pipeline
+
+Automated radio-station playlist generation for **Music Assistant** (MA): scrape a
+station's published tracklists (or read its broadcast API), match every track across
+all MA music providers, build one curated playlist per show per month, and serve a
+live web dashboard of the results at `djs.robertsons.cloud`.
+
+Two stations are wired up:
+
+| Station | Source | Granularity | Example playlist |
+|---|---|---|---|
+| **Dandelion Radio** (UK, John Peel-inspired) | monthly tracklist pages @ dandelionradio.com (Scrapling/HTML) | one playlist per DJ show | `Dandelion Radio - July 2026 - Leo Gilbert on FSK` |
+| **KEXP** (Seattle public radio) | public JSON API @ api.kexp.org/v2 | one aggregate playlist per show per month | `KEXP - April 2026 - Cheryl Waters` |
+
+Everything runs on a small homelab LXC (CT100) under a Scrapling venv; the dashboard
+is a dependency-free Python stdlib HTTP server behind nginx + Cloudflare Tunnel.
+
+---
+
+## Architecture
+
+```
+                 ┌──────────────────────────┐        ┌─────────────────────┐
+ Dandelion site ─▶│ dandelion-to-ma.py       │        │                     │
+ (HTML tables)   │  scrape_month()          ├────────▶ ma_playlist_lib.py  │
+                 └──────────────────────────┘ search │  (shared MA plumbing)│
+                 ┌──────────────────────────┐   create│                     │
+ KEXP API      ──▶│ kexp-to-ma.py            ├────────▶▶ Music Assistant     │
+ (/shows/, /plays/) │ kexp_month_tracks()  │  fill    │ :8095 JSON-RPC      │
+                 └──────────────────────────┘        └──────────┬──────────┘
+                                                                │
+                 ┌──────────────────────────┐                    │ reads
+ djs.robertsons ◀─┤ dandelion-dash.py (:9210)◀────────────────────┘
+  (browser UI)    │  dandelion_dash_lib.py   │  + launches runs via
+                 └──────────────────────────┘    systemd-run (isolated units)
+```
+
+**Data flow per month:** fetch source tracklist → normalize (`artist`, `title`) →
+dedupe (KEXP only — repeated plays across episodes collapse) → for each track:
+`music/search` library-first, then cross-provider → rank candidates by provider
+priority + title/artist agreement → collect URIs → create playlist (or fill gaps in
+an existing one) → wait for MA's background add-tasks → verify track count →
+report expected-vs-found.
+
+## Repository layout
+
+| File | Purpose |
+|---|---|
+| `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker |
+| `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), `--month/--dj/--fill/--resume/--dry-run` |
+| `kexp-to-ma.py` | KEXP station script: airdate-window play walk + client-side episode filtering, same flags |
+| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, run launcher + reconciler |
+| `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache |
+| `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, trigger form, 30 s polling |
+| `kexp-rebuild-months.py` | One-off maintenance tool: deterministic remove-all → re-add rebuild of existing KEXP months (favourites-safe, fail-loud ordering) |
+| `dandelion-cron.sh` / `kexp-cron.sh` | Monthly cron wrappers (2nd, previous month, `--resume`) |
+| `dandelion-fill-cron.sh` / `kexp-fill-cron.sh` | Monthly fill wrappers (3rd, catches late matches) |
+
+## Track matching
+
+Search runs in two tiers per track:
+
+1. **Library-first** (`library_only: true`) — fast check of local files/SMB share.
+2. **Cross-provider fallback** (`library_only: false`, `limit: 20`) — Deezer,
+   Bandcamp, Spotify, filesystem providers in one result set.
+
+Candidates are ranked by **provider priority** (user preference order):
+`local files → Deezer → Bandcamp → Spotify → other`. **BBC Sounds is excluded
+entirely** — a bbc_sounds-only match is never accepted. Within the best provider
+tier, scoring requires *artist confirmation* (≥1 significant shared word between any
+credited artist and the result artist — diacritic-folded, stopword-filtered); title
+overlap alone can't win, which killed a whole class of label-page mismatches.
+Multi-artist credits (`A, B & C`) get a lead-artist query plus a title-only retry.
+One retry after 2 s on timeout; timeouts and other errors are counted separately;
+5 consecutive timeouts trip a circuit breaker (`MAMidRunOutage`) so a dead MA
+aborts the run instead of burning its full timeout budget per remaining track.
+
+Typical match rate: ~85–95% depending on how obscure the programming is; the rest
+are genuinely absent from every connected provider.
+
+## The dashboard
+
+`GET /` serves the SPA; data endpoints:
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/status?station=dandelion\|kexp` | Months → shows with tracks / liked / expected counts + provider breakdown (cached 90 s; expected counts scraped in background threads, cached 1 h in memory + persisted to disk across restarts) |
+| `GET /api/options?station=…` | Chooser data: Dandelion DJ list from playlist names; KEXP all 41 programs + 106 hosts (cached 6 h) |
+| `POST /api/trigger` | `{station, month, dj?, mode}` — launches the station script in its **own transient systemd unit** (`systemd-run --collect --wait`), logs to `~/.hermes/data/dandelion-runs/`, records a JSON run entry watched by a monitor thread. Modes: `auto` (fill if any playlist exists else create), `fill`, `live`, `dry`. Hard cap: 2 concurrent runs (matches MA's 2-slot task queue) → HTTP 429 beyond that |
+| `GET /api/runs` | Last 10 run records; zombie `running` entries whose unit died get reconciled to `died` automatically |
+
+The site reflects MA edits within ~2 minutes (30 s frontend polling + 90 s server
+cache) — there is no static regeneration step. Deleting/reordering tracks in the MA
+UI shows up on its own.
+
+**Security posture:** `/api/trigger` is intentionally unauthenticated (deliberate
+decision for a home dashboard behind the owner's tunnel); the concurrency cap is the
+only abuse brake. Do not expose this to the public internet without adding a token.
+
+## Setup
+
+```bash
+python3 -m venv scrapling_venv
+scrapling_venv/bin/pip install 'scrapling[all]'   # bare scrapling misses runtime deps
+# MA_TOKEN in /root/.bashrc (Music Assistant long-lived token)
+# default MA host 192.168.214.159:8095 (--ma-host to override)
+```
+
+Scripts resolve `MA_TOKEN` from the environment, falling back to parsing
+`/root/.bashrc` — detached systemd units work without an exported shell env.
+
+### Running manually
+
+```bash
+V=/root/.hermes/scripts/scrapling_venv/bin/python3
+
+# One Dandelion DJ, dry-run first (never a bad idea)
+$V dandelion-to-ma.py --month 2026-07 --dj "Mark Whitby" --dry-run
+
+# Whole KEXP month (aggregate Midday Show playlist)
+$V kexp-to-ma.py --month 2026-07 --resume
+
+# Top up an existing month with tracks missed earlier (adds only, likes untouched)
+$V kexp-to-ma.py --month 2026-06 --dj "Cheryl Waters" --fill
+
+# Trigger through the dashboard API
+curl -X POST http://127.0.0.1:9210/api/trigger \
+  -H 'Content-Type: application/json' \
+  -d '{"station":"kexp","month":"2026-04","dj":"Cheryl Waters","mode":"auto"}'
+```
+
+Long manual runs should go through `systemd-run --unit=<name> --collect …` — a bare
+background child dies with the next service restart (learned the hard way; see
+Pitfalls).
+
+### Cron
+
+| Job | When | Does |
+|---|---|---|
+| `*-cron.sh` | 2nd of month, 12:00 NZST | Build previous month (`--resume`) |
+| `*-fill-cron.sh` | 3rd of month | Fill pass over the same month (catches search-timeout misses) |
+
+Dandelion publishes tracklists "at the start of next month"; the 2nd gives a 24 h
+buffer, the fill pass mops up. Cron budgets need ≥7200 s — a full Dandelion month
+(~700 tracks × cross-provider search) can exceed an hour.
+
+## Pitfalls worth knowing (all learned in production)
+
+- **KEXP API ignores most filters.** On `/plays/`, `show=`/`date=`/`program=` are
+  silently ignored (you get the newest ~300 plays regardless — this once made every
+  month look identical); only `airdate_after=`/`airdate_before=`, `ordering`,
+  `artist=`/`song=`/`album=` actually work. On `/shows/`, **every** filter param is
+  ignored including `ordering` — the only way to reach older months is offset
+  pagination through a feed that grows ~9 shows/day. Any hardcoded page cap on that
+  walk is a **time bomb**: an 800-show cap worked when written and silently broke
+  ~12 weeks later ("No trackplays found"). Both walks here are boundary-driven now.
+- **MA `library_items` caps at 500/page** — always paginate; a single-page fetch
+  blinds duplicate protection past position 500.
+- **`add_playlist_tracks` takes `db_playlist_id` (int)**, not `item_id`;
+  `remove_playlist_tracks` takes **positions**, not URIs (an URIs payload 500s);
+  adds/removes run as background tasks (2 slots) — wait on `tasks/list` before
+  verifying counts. `music/playlists/get` 500s on library playlists — use
+  `playlist_tracks`.
+- **Fail-loud everywhere:** every list-fetch returns `None` on API failure and
+  callers exit non-zero. A silent empty set once created 20 duplicate playlists in
+  one night; that class of bug is engineered out, not handled.
+- **Never trust `count` fields** on KEXP paginated endpoints; page until a short page.
+- **Expected-vs-found honesty:** the dashboard scrapes real per-month/per-show
+  expected counts, so a card showing 45% means the playlist really is partial —
+  run fill mode rather than guessing.
+
+## Maintenance tools
+
+`kexp-rebuild-months.py` replaces the content of existing KEXP months in place
+(ids/names preserved): fetch true month → search (cacheable) → remove all positions
+→ verify empty → add true set → verify count, favourites checked before/after.
+Use it when historical months were built by an older, wrong access path.
+
+---
+
+*Private homelab project. No secrets are stored in this repository — tokens live in
+`/root/.hermes/.env` / `.bashrc` on the host.*
