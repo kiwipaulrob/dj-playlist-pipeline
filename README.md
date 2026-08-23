@@ -47,7 +47,7 @@ report expected-vs-found.
 | File | Purpose |
 |---|---|
 | `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker, **unavailable-tracks store** (`record_unavailable*`/`clear_unavailable*`) |
-| `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), `--month/--dj/--fill/--resume/--dry-run` |
+| `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), **absent-DJ detection** (`absent_djs()` — headers that parsed but yielded 0 track rows), `--month/--dj/--fill/--resume/--dry-run` |
 | `kexp-to-ma.py` | KEXP station script: airdate-window play walk + client-side episode filtering, same flags |
 | `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create), per-card unavailable summary |
 | `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache, `known_months()`/`months_with_playlists()` (pre-creation support), fail-loud `existing_for()` |
@@ -107,6 +107,22 @@ The dashboard surfaces this per card: a red **⚠ unavailable N ▾** chip that 
 to the full track list with colour-coded reason badges (red = permanent `no_match`,
 amber = retryable timeout/api error) and attempt counts. The status payload exposes
 the same data as `unavailable[month][dj]`.
+
+## Ingestion safeguards (scrape & stream hygiene)
+
+Both ingestion paths fail soft on *individual* anomalies and fail loud on *total* ones:
+
+| Guard | Where | Behavior |
+|---|---|---|
+| Zero-section scrape | `dandelion-to-ma.py` | No DJ sections at all → `exit 1` (never build an empty month) |
+| **Absent-DJ detection** (PR-E) | `dandelion-to-ma.py` | A DJ header that parsed but produced **0 track rows** is dropped from the build AND reported in an `⚠️ ABSENT DJS` output block — how silent site-layout breakage presents |
+| Low track count | `dandelion-to-ma.py` | Any section with <3 tracks warns loudly but continues (Dandelion publishes progressively; fill reconciles later) |
+| Non-track plays | `kexp_play_walk` | `play_type != "trackplay"` and blank artist/song dropped client-side |
+| Consecutive-spin dedupe | `kexp_play_walk` | Same artist+title within ≤600 s collapses inline; the window extends through repeat runs (12:00→12:03→12:06 = one spin). Interleaved different songs are kept — cross-run repeats stay owned by the global artist\|title dedupe |
+| Global dedupe | `kexp_month_tracks` | Final pass: no duplicate artist\|title pair enters search |
+
+All guards are warning-grade (except zero-sections) so a partial publish never kills a
+monthly build; the dashboard's expected-vs-found bars make any shortfall visible.
 
 ## The dashboard
 
@@ -211,6 +227,10 @@ buffer, the fill pass mops up. Cron budgets need ≥7200 s — a full Dandelion 
 - **Expected-vs-found honesty:** the dashboard scrapes real per-month/per-show
   expected counts, so a card showing 45% means the playlist really is partial —
   run fill mode rather than guessing.
+- **Empty ≠ absent.** An empty scrape can mean three things: the station hasn't
+  published yet, the page layout changed, or the DJ genuinely had an empty show.
+  Only the first is normal — that's why absent-DJ detection exists: headers with
+  zero surviving rows are reported, never silently swallowed.
 - **Unavailable ≠ lost.** A track missing from a playlist is either in the
   unavailable store (check the card's red chip for its reason) or genuinely absent
   from every provider. Timeouts recorded there are exactly what the monthly fill

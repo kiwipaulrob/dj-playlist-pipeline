@@ -42,11 +42,17 @@ def scrape_month(month):
         page = Fetcher.get(url)
     except Exception as e:
         print(f"  ❌ Failed to fetch {url}: {e}")
+        scrape_month.last_absent = []   # PR-E: no stale absent list across runs
         return {}
 
     sections = {}
     current_dj = None
 
+    # PR-E (24 Aug 2026): absent-DJ detection — a DJ whose header parsed but
+    # whose track rows ALL failed extraction is dropped by the empty-section
+    # filter below and would vanish silently. Keep a separate record of every
+    # DJ header seen, so callers can warn when a known DJ has no tracks.
+    dj_headers_seen = set()
     for tr in page.css('tr'):
         # Check for DJ header: <b>DJ Name - Month YYYY</b>
         # Only tdblue cells with an anchor contain DJ headers — not plain <b> in track rows
@@ -58,6 +64,7 @@ def scrape_month(month):
             m = re.match(r'(.+?)\s*-\s*(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}', clean)
             if m:
                 current_dj = m.group(1).strip()
+                dj_headers_seen.add(current_dj)
                 if current_dj not in sections:
                     sections[current_dj] = []
                 continue
@@ -85,7 +92,19 @@ def scrape_month(month):
                         })
 
     # Remove empty sections
-    return {k: v for k, v in sections.items() if v}
+    out = {k: v for k, v in sections.items() if v}
+
+    # PR-E: absent-DJ report — headers with no surviving track rows.
+    # Returned alongside the sections so callers can warn (fail-soft) instead
+    # of a known DJ vanishing from a month without a trace.
+    absent = sorted(dj_headers_seen - set(out.keys()))
+    scrape_month.last_absent = absent
+    return out
+
+
+def absent_djs():
+    """DJ headers seen by the LAST scrape_month() call that produced 0 tracks."""
+    return getattr(scrape_month, "last_absent", [])
 
 
 def get_playlist_map(token):
@@ -154,6 +173,16 @@ def main():
         if len(tr) < 3:
             print(f"      ⚠️  LOW TRACK COUNT for {dj!r} ({len(tr)}) — "
                   f"possible tracklist page layout change; verify before trusting")
+
+    # PR-E (24 Aug 2026): absent-DJ detection — headers that parsed but whose
+    # track rows all failed extraction. A known DJ vanishing from the month is
+    # exactly how silent layout breakage presents; warn and continue.
+    absent = absent_djs()
+    if absent:
+        print(f"\n  ⚠️  ABSENT DJS — headers found on page but 0 tracks extracted:")
+        for dj in absent:
+            print(f"      ⚠️  {dj!r}: no tracks scraped (layout change or "
+                  f"empty show) — playlist NOT created/updated for this DJ")
 
     if args.dj:
         sections = {k: v for k, v in sections.items() if args.dj.lower() in k.lower()}

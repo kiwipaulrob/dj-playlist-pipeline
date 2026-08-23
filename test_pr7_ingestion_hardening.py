@@ -127,5 +127,136 @@ interesting3 = [t for t in out3 if t[0] in ("B", "C")]
 check("malformed airdate filtered upstream; dedupe still correct",
       interesting3 == [("B", "Y"), ("C", "Z")], f"{interesting3}")
 
+# ---- PR-E: absent-DJ detection (scrape_month with mocked Fetcher) ----
+import importlib.util as _ilu
+
+_dspec = _ilu.spec_from_file_location(
+    "_d2ma", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "dandelion-to-ma.py"))
+d2ma = importlib.util.module_from_spec(_dspec)
+_dspec.loader.exec_module(d2ma)
+
+
+class FakePage:
+    def __init__(self, html):
+        self._html = html
+
+    def css(self, sel):
+        # minimal support for the selectors scrape_month uses
+        if sel == 'tr':
+            import re as _re
+            rows = []
+            for tr_html in _re.findall(r"<tr>(.*?)</tr>", self._html, _re.S):
+                rows.append(FakeRow(tr_html))
+            return rows
+        return []
+
+
+class FakeNode:
+    def __init__(self, html):
+        self.html_content = html
+
+    def css(self, sel):
+        return [self] if sel == '::text' and False else []
+
+
+class FakeTd(FakeNode):
+    pass
+
+
+class FakeRow:
+    def __init__(self, html):
+        self._html = html
+        import re as _re
+        self.tds = [_FakeTd(h) for h in _re.findall(r"<td[^>]*>(.*?)</td>", html, _re.S)]
+        b = _re.findall(r"<b>(.*?)</b>", html, _re.S)
+        self.b = [type("B", (), {"html_content": b[0]})()] if b else []
+
+    def css(self, sel):
+        if sel == 'td.tdblue b':
+            return self.b
+        if sel == 'td.tdblue':
+            return [type("TD", (), {"css": lambda s, _: self.b})()] if self.b else []
+        if sel == 'td':
+            return self.tds
+        if sel == 'td.tdheadings':
+            return []
+        return []
+
+
+class _FakeTd:
+    """Text-bearing td: first ::text node is its stripped content."""
+
+    def __init__(self, html):
+        import re as _re
+        self.texts = [t for t in _re.sub(r"<[^>]+>", "", html).split("\n") if t.strip()]
+
+    def css(self, sel):
+        class L(list):
+            def get(self):
+                return self[0] if self else None
+        return L(self.texts) if sel == '::text' else L([])
+
+
+HTML_OK = """
+<table>
+<tr><td class="tdblue"><a><b>DJ Mark Whitby - August 2026</b></a></td></tr>
+<tr><td><a href="#">The Fall</a></td><td>Totally Wired</td><td></td><td></td><td></td></tr>
+<tr><td><a href="#">Bauhaus</a></td><td>She's in Parties</td><td></td><td></td><td></td></tr>
+<tr><td><a href="#">Chameleons</a></td><td>Swamp Thing</td><td></td><td></td><td></td></tr>
+<tr><td class="tdblue"><a><b>DJ Ann Unknown - August 2026</b></a></td></tr>
+<tr><td><a href="#">R.E.M.</a></td><td>Driver 8</td><td></td><td></td><td></td></tr>
+<tr><td><a href="#">10,000 Maniacs</a></td><td>What's the Weather?</td><td></td><td></td><td></td></tr>
+</table>"""
+
+# DJ whose header parses but track rows are all malformed -> absent
+HTML_ABSENT = HTML_OK.replace(
+    '<tr><td><a href="#">R.E.M.</a></td><td>Driver 8</td><td></td><td></td><td></td></tr>\n'
+    '<tr><td><a href="#">10,000 Maniacs</a></td><td>What\'s the Weather?</td><td></td><td></td><td></td></tr>',
+    '')
+
+orig_get = d2ma.Fetcher.get
+
+
+class FakeFetcher:
+    html = HTML_OK
+
+    @staticmethod
+    def get(url):
+        return FakePage(FakeFetcher.html)
+
+
+d2ma.Fetcher = FakeFetcher
+
+# happy path: no absent DJs
+FakeFetcher.html = HTML_OK
+secs = d2ma.scrape_month("2026-08")
+check("happy path: both DJs have tracks", sorted(secs) == ["DJ Ann Unknown", "DJ Mark Whitby"],
+      f"{sorted(secs)}")
+check("happy path: absent list empty", d2ma.absent_djs() == [], f"{d2ma.absent_djs()}")
+
+# layout-drift path: one DJ's rows vanish
+FakeFetcher.html = HTML_ABSENT
+secs2 = d2ma.scrape_month("2026-08")
+check("drift: healthy DJ still parsed", list(secs2) == ["DJ Mark Whitby"], f"{list(secs2)}")
+check("drift: empty section dropped", "DJ Ann Unknown" not in secs2)
+check("drift: absent DJ reported", d2ma.absent_djs() == ["DJ Ann Unknown"],
+      f"{d2ma.absent_djs()}")
+
+# fetch failure resets state cleanly
+class DeadFetcher:
+    @staticmethod
+    def get(url):
+        raise RuntimeError("connection refused")
+
+
+d2ma.Fetcher = DeadFetcher
+check("fetch failure returns {}", d2ma.scrape_month("2026-08") == {})
+check("fetch failure clears stale absent list", d2ma.absent_djs() == [],
+      f"{d2ma.absent_djs()}")
+
+d2ma.Fetcher = orig_get
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
+
