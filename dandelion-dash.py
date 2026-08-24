@@ -21,6 +21,8 @@ import subprocess
 import sys
 import time
 import threading
+import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -341,6 +343,14 @@ def launch_run(station, month, dj=None, dry_run=False, fill=False, resume=True):
             mplib.atomic_write_json(rec_path, r)
         except Exception:
             pass
+        # PR-E2 visual cache: a finished build/fill changes the playlist —
+        # drop the stale cover-wall payload so the next view rebuilds fresh.
+        try:
+            lib.visual_cache_invalidate(station=rec.get("station"),
+                                        month=rec.get("month"),
+                                        dj=rec.get("dj"))
+        except Exception:
+            pass
     threading.Thread(target=_watch, args=(proc, os.path.join(lib.RUNS_DIR, f"{run_id}.json")),
                      daemon=True).start()
     return rec
@@ -489,6 +499,55 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"shows": [], "djs": lib.station_djs("dandelion")}).encode())
         elif path.startswith("/api/runs"):
             self._send(200, json.dumps(lib_run_state()).encode())
+        elif path.startswith("/api/visual"):
+            # PR-E2 (24 Aug 2026): cover-wall payload for one playlist.
+            # Query values arrive percent-encoded (%20 in DJ names) — decode.
+            station = urllib.parse.unquote(query.get("station", "dandelion"))
+            month = urllib.parse.unquote(query.get("month", ""))
+            dj = urllib.parse.unquote(query.get("dj", ""))
+            if station not in lib.STATIONS:
+                self._send(400, json.dumps({"error": f"unknown station '{station}'"}).encode())
+                return
+            if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+                self._send(400, json.dumps({"error": "month must be YYYY-MM"}).encode())
+                return
+            if not dj:
+                self._send(400, json.dumps({"error": "dj required"}).encode())
+                return
+            cached = lib.visual_cache_read(station, month, dj)
+            if cached:
+                cached["cached"] = True
+                self._send(200, json.dumps(cached).encode())
+                return
+            # Fail-loud outage check BEFORE trusting any empty result
+            payload = lib.visual_rows(station, month, dj)
+            if payload is None:
+                self._send(503, json.dumps({"error": "source scrape or MA unavailable — try again shortly"}).encode())
+                return
+            payload["cached"] = False
+            try:
+                lib.visual_cache_write(payload)
+            except Exception:
+                pass
+            self._send(200, json.dumps(payload).encode())
+        elif path.startswith("/api/art"):
+            # PR-E2 review fix A: LAN proxy for MA-hosted images that the
+            # browser can't reach through Cloudflare Tunnel. Only allows
+            # private-network http(s) URLs; CDN URLs are passed by the client
+            # directly and never hit this route.
+            art = urllib.parse.unquote(query.get("url", ""))
+            if not lib._ART_HOST_RE.match(art):
+                self._send(400, b'{"error":"non-LAN art url rejected"}')
+                return
+            tok = mplib.get_ma_token()
+            req = urllib.request.Request(art, headers={"Authorization": f"Bearer {tok}"})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    body = r.read(2_000_000)   # covers are <=1MB typically
+                    ctype = r.headers.get("Content-Type", "image/jpeg")
+                self._send(200, body, ctype)
+            except Exception:
+                self._send(502, b'{"error":"art fetch failed"}')
         else:
             self._send(404, b'{"error":"not found"}')
 
