@@ -32,6 +32,32 @@ h1 { font-size:20px; margin-bottom:4px; }
 .tab.on { background:var(--acc); border-color:var(--acc); color:#0d1117; font-weight:600; }
 .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
 .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+
+/* Visual playlist cover wall (PR-E2) */
+.vgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(128px,1fr)); gap:14px; }
+@media (max-width:640px){ .vgrid { grid-template-columns:repeat(auto-fill,minmax(104px,1fr)); gap:10px; } }
+.vtile { position:relative; aspect-ratio:1/1; background:var(--card); border:1px solid var(--border);
+         border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+.vtile img { width:100%; aspect-ratio:1/1; object-fit:cover; opacity:0; transition:opacity .3s ease; }
+.vtile img.ok { opacity:1; }
+.vtile .vfall { position:absolute; inset:0 0 auto 0; height:auto; aspect-ratio:1/1;
+                display:flex; align-items:center; justify-content:center;
+                font-size:28px; font-weight:700; color:var(--muted); letter-spacing:.05em; }
+.vtile img.ok ~ .vfall { display:none; }
+.vtile.mono .vfall { color:var(--fg); }
+.vtile.ghost { border-style:dashed; background:transparent; }
+.vtile.ghost .vwarn { aspect-ratio:1/1; display:flex; align-items:center; justify-content:center;
+                      font-size:30px; color:#f0883e; }
+.vmeta { padding:6px 7px 7px; font-size:11px; line-height:1.35; display:flex; flex-direction:column; gap:1px;
+         min-height:52px; }
+.vmeta .va { font-weight:600; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vmeta .vt { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.vmeta .vp { margin-top:2px; align-self:flex-start; }
+.vmeta .why { margin-top:2px; align-self:flex-start; font-size:10px; padding:1px 6px; border-radius:6px; }
+.vmeta .why.no_match { background:#3d1618; color:#f85149; }
+.vmeta .why.timeout, .vmeta .why.api_error { background:#3b2a10; color:#f0883e; }
+.vmeta .why:not(.no_match):not(.timeout):not(.api_error) { background:#24292e; color:var(--muted); }
+.vlink::before { content:'·'; margin:0 2px; color:var(--muted); }
 .card .dj { font-weight:600; margin-bottom:2px; }
 .malink { font-size:11px; font-weight:500; color:var(--acc); text-decoration:none;
          margin-left:8px; border:1px solid var(--border); border-radius:4px; padding:1px 6px; }
@@ -259,7 +285,9 @@ function renderGrid() {
       <div class="dj">${escapeHtml(dj)}
         <a class="malink" target="_blank" rel="noopener"
            href="https://music.robertsons.cloud/#/playlists/library/${s.id}"
-           title="Open in Music Assistant">↗ MA</a></div>
+           title="Open in Music Assistant">↗ MA</a>
+        <a class="malink vlink" href="#/visual/${station}/${curMonth}/${encodeURIComponent(dj)}"
+           title="Visual playlist — album cover wall">👁 visual</a></div>
       <div class="meta">${s.name} · id ${s.id}</div>
       <div class="bar ${barCls}"><div style="width:${Math.min(100,barW)}%"></div></div>
       <div class="row"><span>expected ${expected ?? '?'} · found ${have ?? '?'}</span>
@@ -277,6 +305,84 @@ function toggleUnavail(chip) {
   if (list) list.classList.toggle('open');
 }
 
+/* ---- Visual playlists (PR-E2, 24 Aug 2026) ---------------------------- */
+/* Hash route: #/visual/{station}/{YYYY-MM}/{dj} — album cover wall with   */
+/* ghost tiles for unavailable tracks. Read-only; /api/visual + /api/art.  */
+
+let visualTimer = null;
+
+function artUrl(row) {
+  // CDN (remotely_accessible) → passthrough; LAN-hosted → /api/art proxy
+  if (!row.image) return null;
+  try {
+    const u = new URL(row.image, location.origin);
+    if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(u.hostname))
+      return '/api/art?url=' + encodeURIComponent(u.href);
+    return u.href;
+  } catch (e) { return null; }
+}
+
+function monogram(artist, title) {
+  const a = (artist || '?').trim()[0] || '?';
+  const b = (title || '').trim()[0] || '';
+  return (a + b).toUpperCase();
+}
+
+async function showVisual(stationArg, monthArg, djArg) {
+  clearTimeout(visualTimer);
+  const grid = document.getElementById('grid');
+  const tabs = document.getElementById('tabs');
+  tabs.innerHTML = '';
+  grid.innerHTML = '<div class="sub">loading covers…</div>';
+  let v;
+  try {
+    const r = await fetch('/api/visual?station=' + encodeURIComponent(stationArg) +
+      '&month=' + encodeURIComponent(monthArg) + '&dj=' + encodeURIComponent(djArg));
+    if (r.status === 503) { grid.innerHTML = '<div class="sub">⚠ source or MA unavailable — retry shortly <button onclick="showVisual(\'' + stationArg + '\',\'' + monthArg + '\',\'' + djArg.replace(/'/g, "\\'") + '\')">retry</button></div>'; return; }
+    if (!r.ok) { grid.innerHTML = '<div class="sub">error ' + r.status + '</div>'; return; }
+    v = await r.json();
+  } catch (e) { grid.innerHTML = '<div class="sub">visual API unreachable</div>'; return; }
+
+  const s = v.summary || {};
+  document.getElementById('stationbar').innerHTML =
+    `<a class="malink" href="#/">◀ back to cards</a>` +
+    `<div class="stationinfo"><h2>${escapeHtml(v.dj)}</h2>` +
+    `<div class="tag">${v.station === 'kexp' ? 'KEXP' : 'Dandelion Radio'} · ${escapeHtml(v.month)} · ` +
+    `${s.total} tracks · ${s.matched} matched · ${s.unavailable} unavailable` +
+    `${v.exists ? '' : ' · <b>not built yet — preview from tracklist</b>'}` +
+    `${v.cached ? ' · cached' : ''}</div></div>`;
+  document.title = v.dj + ' — visual playlist';
+
+  grid.innerHTML = '<div class="vgrid">' + v.tracks.map(t => {
+    const u = artUrl(t);
+    if (t.found) {
+      const img = u
+        ? `<img loading="lazy" alt="" src="${escapeHtml(u)}" onload="this.classList.add('ok')" onerror="this.closest('.vtile').classList.add('mono'); this.remove()">`
+        : '';
+      return `<div class="vtile${u ? '' : ' mono'}">${img}` +
+        `<div class="vfall">${escapeHtml(monogram(t.artist, t.title))}</div>` +
+        `<div class="vmeta"><span class="va">${escapeHtml(t.artist)}</span><span class="vt">${escapeHtml(t.title)}</span>` +
+        `<span class="prov vp">${escapeHtml(t.provider || '')}</span></div></div>`;
+    }
+    const why = t.reason || 'not in playlist';
+    return `<div class="vtile ghost">` +
+      `<div class="vwarn">⚠</div>` +
+      `<div class="vmeta"><span class="va">${escapeHtml(t.artist)}</span><span class="vt">${escapeHtml(t.title)}</span>` +
+      `<span class="why ${escapeHtml(why)}" title="${t.attempts ? t.attempts + ' attempt(s)' : ''}">${escapeHtml(why)}</span></div></div>`;
+  }).join('') + '</div>';
+}
+
+function route() {
+  const h = location.hash || '#/';
+  const m = h.match(/^#\/visual\/([^/]+)\/([^/]+)\/(.+)$/);
+  if (m) {
+    showVisual(decodeURIComponent(m[1]), decodeURIComponent(m[2]), decodeURIComponent(m[3]));
+    return true;
+  }
+  return false;
+}
+window.addEventListener('hashchange', () => { if (!route()) location.reload(); });
+
 function renderRuns() {
   const runs = (DATA.runs || []).filter(r => !r.station || r.station === station);
   document.getElementById('runs').innerHTML = runs.length ? runs.map(r =>
@@ -285,6 +391,9 @@ function renderRuns() {
 }
 
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+/* boot: if the URL is a #/visual/... deep link, render that instead of cards */
+if (route()) { /* visual view rendered by route(); skip card load below */ }
 
 document.getElementById('trig').onsubmit = async (e) => {
   e.preventDefault();
@@ -308,8 +417,10 @@ document.getElementById('trig').onsubmit = async (e) => {
 
 renderStatTabs();
 loadOptions();
-load();
-setInterval(load, 30000);
+if (!route()) {          // deep-linked #/visual views skip the card loader
+  load();
+  setInterval(load, 30000);
+}
 </script>
 </body>
 </html>

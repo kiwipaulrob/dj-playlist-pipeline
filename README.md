@@ -49,8 +49,8 @@ report expected-vs-found.
 | `ma_playlist_lib.py` | **Shared MA plumbing** (single source of truth): token handling, JSON-RPC `_api`, provider-priority search (`search_ma`/`_pick_best`), paginated playlist listing, create/add/remove/wait/verify helpers, fail-loud contract + mid-run outage circuit breaker, **unavailable-tracks store** (`record_unavailable*`/`clear_unavailable*`) |
 | `dandelion-to-ma.py` | Dandelion station script: HTML scraping (Scrapling CSS selectors), **absent-DJ detection** (`absent_djs()` — headers that parsed but yielded 0 track rows), `--month/--dj/--fill/--resume/--dry-run` |
 | `kexp-to-ma.py` | KEXP station script: airdate-window play walk + client-side episode filtering, same flags |
-| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create), per-card unavailable summary |
-| `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache, `known_months()`/`months_with_playlists()` (pre-creation support), fail-loud `existing_for()` |
+| `dandelion-dash.py` | Dashboard HTTP server: `/api/status`, `/api/options`, `/api/runs`, `/api/trigger`, `/api/visual` + `/api/art` (PR-E2), `/health`; status cache (90 s), background expected-count scrapes, pre-creation expected counts, run launcher + reconciler, fail-loud trigger routing (HTTP 503 when MA is unreachable instead of guessing fill-vs-create), per-card unavailable summary |
+| `dandelion_dash_lib.py` | Dashboard data layer: MA snapshots, favourites/liked counting, provider chip counts, KEXP API access paths (`kexp_play_walk`, `kexp_episode_ids`, `kexp_expected`, `kexp_options`), Dandelion scraper, disk-persisted expected-count cache, `known_months()`/`months_with_playlists()` (pre-creation support), fail-loud `existing_for()` , visual-playlist assembly (`visual_rows`, PR-E2) |
 | `dandelion-dash.html` | Frontend (vanilla JS): station tabs, month tabs, completeness bars, per-provider chips, red **unavailable** chips with expandable no-provider track lists, "Not built yet" placeholder cards for unbuilt months, trigger form, 30 s polling |
 | `test_pr1_precreate.py` | Test suite: pre-creation expected counts (cache namespaces, persistence, None-total semantics); accepts an optional variant arg (`python3 test_pr1_precreate.py pr1`) to run against standalone branch variants |
 | `test_pr2_existing.py` | Test suite: `existing_for()` outage disambiguation + trigger 503/routing; installs a tripwire so any unmocked `launch_run` fails loudly instead of spawning real runs |
@@ -134,6 +134,7 @@ monthly build; the dashboard's expected-vs-found bars make any shortfall visible
 | `GET /api/options?station=…` | Chooser data: Dandelion DJ list from playlist names; KEXP all 41 programs + 106 hosts (cached 6 h) |
 | `POST /api/trigger` | `{station, month, dj?, mode}` — launches the station script in its **own transient systemd unit** (`systemd-run --collect --wait`), logs to `~/.hermes/data/dandelion-runs/`, records a JSON run entry watched by a monitor thread. Modes: `auto` (fill if any playlist exists else create), `fill`, `live`, `dry`. **Fail-loud routing:** when `existing_for()` cannot reach MA it aborts with HTTP 503 instead of misreading the outage as "nothing exists". Hard cap: 2 concurrent runs (matches MA's 2-slot task queue) → HTTP 429 beyond that |
 | `GET /api/runs` | Last 10 run records; zombie `running` entries whose unit died get reconciled to `died` automatically (reconciler window = lexicographic top-10 of the runs dir) |
+| `GET /api/visual?station=&month=&dj=` | **Visual playlist payload** (PR-E2): ordered rows joining the station-source tracklist with the MA playlist's track objects and the unavailable store; CDN covers pass through, LAN-hosted art routes via `/api/art`. Cached 15 min, invalidated on run completion. `503` on source/MA failure. |
 
 ### Pre-creation expected counts
 
@@ -235,6 +236,29 @@ buffer, the fill pass mops up. Cron budgets need ≥7200 s — a full Dandelion 
   unavailable store (check the card's red chip for its reason) or genuinely absent
   from every provider. Timeouts recorded there are exactly what the monthly fill
   pass retries — the store and the fill reconcile each other.
+
+## Visual playlists (PR-E2, 24 Aug 2026)
+
+Every card carries a **👁 visual** link → a hash-routed cover wall (`#/visual/{station}/{month}/{dj}`)
+showing the DJ's published setlist as album-art tiles, in broadcast order:
+
+- **Found tracks** render their cover (lazy-loaded, aspect-ratio fixed so the grid never shifts),
+  provider chip beneath; covers come from MA's own track objects — no third-party calls.
+  Public CDN images (Deezer/Bandcamp/Spotify) load directly; anything LAN-hosted routes through
+  `GET /api/art?url=…` (RFC1918-URLs-only proxy, MA-authenticated) so remote access via Cloudflare
+  Tunnel still works.
+- **Missing tracks stay in sequence as ghost tiles** — dashed frame, ⚠, reason badge reusing the
+  unavailable store's vocabulary (`no_match` red, timeout/api_error amber). The wall is honest:
+  gaps are visible where they occur, never hidden.
+- **Not-built-yet months preview as all-ghost walls** straight from the tracklist — see what a
+  build *would* produce before triggering one.
+- Payloads cache per playlist (`data/visual-cache-*.json`, atomic writes) for 15 minutes and are
+  actively deleted when a trigger run for that playlist finishes.
+
+Known upstream limitation: Music Assistant currently fails to fetch artwork for some local SMB
+files ("Error while fetching image …" in its log); those tiles fall back to artist-title monograms
+until fixed upstream. Verified live: Dandelion Andrew Morrison July 2026 → 11/12 matched, 9 CDN
+covers; KEXP Cheryl Waters July 2026 → 548/656 matched, 542 covers.
 
 ## Maintenance tools
 

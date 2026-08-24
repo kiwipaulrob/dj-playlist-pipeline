@@ -191,6 +191,288 @@ def _all_playlists_failed():
     return not isinstance(page, list)
 
 
+# ---- Visual playlists (PR #10 / PR-E2, 24 Aug 2026) -------------------------
+# Cover-art tile wall per station/month/DJ. READ-ONLY: assembles rows from
+# three sources joined on norm_key — station-source order, the MA playlist's
+# track objects, and the unavailable store. Never mutates MA.
+
+VISUAL_CACHE_DIR = "/root/.hermes/data"
+VISUAL_TTL = 15 * 60          # 15 min; active-invalidated on run completion
+_ART_HOST_RE = re.compile(r"^https?://(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)")
+
+
+def _ma_image_url(track_obj):
+    """Best image for a MA playlist-track object → URL the BROWSER can load.
+
+    T0 probe (24 Aug 2026): images live in metadata.images[] ({path,
+    remotely_accessible, proxy_id}); top-level/album 'image' was null.
+    - remotely_accessible CDN URLs (Deezer/Spotify/Bandcamp) → passthrough;
+      verified reachable from outside via HEAD 200 image/jpeg.
+    - Local SMB paths are NOT remotely accessible and MA's own
+      /imageproxy/<proxy_id> 404s for them today (server-side fetch bug,
+      'Error while fetching image' in MA logs) → return None; tile falls
+      back to monogram until that's fixed upstream.
+    """
+    md = track_obj.get("metadata") or {}
+    imgs = md.get("images") or []
+    if not imgs:
+        return None
+    im = imgs[0]
+    path = im.get("path") or ""
+    if im.get("remotely_accessible") and path.startswith("http"):
+        return path
+    return None
+
+
+def _track_image(track_obj):
+    """Extract (url_or_None, provider_domain) for a playlist track."""
+    url = _ma_image_url(track_obj)
+    prov = (track_obj.get("provider_mappings") or [{}])[0].get(
+        "provider_domain") or track_obj.get("provider") or ""
+    return url, prov
+
+
+def _source_tracks(station, month, dj=None):
+    """Station-source expected tracks in published order.
+
+    Dandelion: full scrape of the month page (rows tagged with '_dj').
+    KEXP: kexp_play_walk for the month, filtered to the show via episode ids.
+    Returns list[{artist,title}] or None on failure (fail-loud).
+    """
+    try:
+        if station == "kexp":
+            # Mirror kexp_expected(): resolve the show to episode ids, then
+            # walk only those episodes. Without this, the airdate window
+            # returns EVERY KEXP play in the month (~8k rows), not the show.
+            show_ids = None
+            if dj:
+                show_ids = kexp_episode_ids(month, dj)
+                if show_ids is None:
+                    return None          # API failure — fail loud (503)
+            plays = kexp_play_walk(month, show_ids=show_ids)
+            if plays is None:
+                return None
+            seen, out = set(), []
+            for artist, title in plays:
+                key = norm(f"{artist} {title}")
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"artist": artist, "title": title})
+            return out
+        sections = dandelion_sections(month)
+        if sections is None:
+            return None
+        return sections
+    except Exception:
+        return None
+
+
+def _playlist_map_dualkey(tracks_list):
+    """{norm_key: track_obj} with BOTH raw and cleaned variants (review fix B).
+
+    search_ma matches via tiered normalization ("Totally Wired (Live at BBC)"
+    resolves to canonical "Totally Wired"), so joining raw source strings
+    against raw MA names alone would false-ghost every cleaned match. Index
+    each playlist track under its raw key AND its primary-artist/clean-title
+    key; lookups try raw first then cleaned.
+    """
+    import ma_playlist_lib as mplib
+
+    def keys_for(artist, title):
+        k_raw = f"{artist.strip().lower()}|{title.strip().lower()}"
+        prim = re.split(r"\s+(?:feat\.?|ft\.?|featuring)\s+", artist,
+                        flags=re.IGNORECASE)[0].strip()
+        t_clean = mplib._clean_title(title)
+        k_clean = f"{prim.lower()}|{t_clean.strip().lower()}"
+        return k_raw, k_clean
+
+    pmap = {}
+    for t in tracks_list or []:
+        if not isinstance(t, dict):
+            continue
+        arts = " ".join((a.get("name") or "") for a in (t.get("artists") or []))
+        name = t.get("name") or ""
+        if not arts or not name:
+            continue
+        k_raw, k_clean = keys_for(arts, name)
+        pmap.setdefault(k_raw, t)
+        pmap.setdefault(k_clean, t)
+    return pmap
+
+
+def visual_rows(station, month, dj):
+    """Assemble ordered rows for the visual view. Returns dict payload or None.
+
+    Payload: {station, month, dj, exists, generated, summary, tracks:[...]}
+    Returns None ONLY on source-scrape failure or MA outage (fail-loud → 503).
+    An unbuilt month yields exists=False with ghost rows (pre-create preview).
+    """
+    import ma_playlist_lib as mplib
+
+    src = _source_tracks(station, month, dj=dj)
+    if src is None:
+        return None
+    if dj and station == "dandelion":
+        # page rows carry a '_dj' marker — filter to the requested DJ
+        want = dj.lower()
+        src = [t for t in src if t.get("_dj", "").lower() == want]
+        if not src:
+            return {"station": station, "month": month, "dj": dj,
+                    "exists": False, "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "summary": {"total": 0, "matched": 0, "unavailable": 0},
+                    "tracks": [], "absent_dj": True}
+    # unavailable store slice for this playlist
+    unav = {}
+    try:
+        store = mplib.load_unavailable()
+    except Exception:
+        store = {}
+    prefix = STATIONS.get(station, STATIONS["dandelion"])["prefix"]
+    y, m = month.split("-")
+    mon_name = MONTH_NAMES[int(m)]
+    for ent in store.values():
+        if (ent.get("station") == station and ent.get("month") == month
+                and ent.get("dj") == dj):
+            unav[f"{ent['artist'].strip().lower()}|{ent['title'].strip().lower()}"] = ent
+
+    pid = _existing_playlist_id(station, month, dj)
+    pl_tracks = None
+    if pid is not None:
+        tr = ma_call("music/playlists/playlist_tracks",
+                     {"item_id": str(pid),
+                      "provider_instance_id_or_domain": "library"}, timeout=60)
+        if isinstance(tr, list):
+            pl_tracks = tr
+        else:
+            return None     # MA outage mid-request — fail loud
+
+    pmap = _playlist_map_dualkey(pl_tracks) if pl_tracks else {}
+
+    rows, matched = [], 0
+    for pos, t in enumerate(src, 1):
+        artist, title = t.get("artist", ""), t.get("title", "")
+        k_raw = f"{artist.strip().lower()}|{title.strip().lower()}"
+        prim = re.split(r"\s+(?:feat\.?|ft\.?|featuring)\s+", artist,
+                        flags=re.IGNORECASE)[0].strip()
+        k_clean = f"{prim.lower()}|{mplib._clean_title(title).strip().lower()}"
+        hit = pmap.get(k_raw) or pmap.get(k_clean)
+        row = {"pos": pos, "artist": artist, "title": title}
+        if hit:
+            matched += 1
+            img, prov = _track_image(hit)
+            row.update(found=True, image=img, provider=prov)
+        else:
+            u = unav.get(k_raw) or {}
+            row.update(found=False, reason=u.get("reason", ""),
+                       attempts=u.get("attempts"))
+        rows.append(row)
+
+    return {
+        "station": station, "month": month, "dj": dj,
+        "exists": pl_tracks is not None,
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": {"total": len(rows), "matched": matched,
+                    "unavailable": len(rows) - matched},
+        "tracks": rows,
+    }
+
+
+def _existing_playlist_id(station, month, dj):
+    """item_id of the station/month/dj playlist, or None if absent.
+
+    Uses all_playlists(); returns the string item_id. Callers distinguish
+    outage via _all_playlists_failed() before trusting None here.
+    """
+    prefix = STATIONS.get(station, STATIONS["dandelion"])["prefix"]
+    try:
+        y, m = month.split("-")
+        mon_name = MONTH_NAMES[int(m)]
+    except Exception:
+        return None
+    want = f"{prefix} - {mon_name} {y} - {dj}".lower()
+    for p in all_playlists():
+        if (p.get("name") or "").lower() == want:
+            return str(p.get("item_id"))
+    return None
+
+
+def visual_cache_path(station, month, dj):
+    slug = re.sub(r"[^a-z0-9]+", "-", (dj or "").lower()).strip("-")[:40]
+    return os.path.join(VISUAL_CACHE_DIR,
+                        f"visual-cache-{station}-{month}-{slug or 'all'}.json")
+
+
+def visual_cache_read(station, month, dj):
+    """Cached payload within TTL, else None. Atomic-write files only."""
+    p = visual_cache_path(station, month, dj)
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        if time.time() - data.get("_ts", 0) < VISUAL_TTL:
+            data.pop("_ts", None)
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def visual_cache_write(payload):
+    import ma_playlist_lib as mplib
+    p = visual_cache_path(payload["station"], payload["month"], payload["dj"])
+    body = dict(payload)
+    body["_ts"] = time.time()
+    mplib.atomic_write_json(p, body)
+
+
+def visual_cache_invalidate(station=None, month=None, dj=None):
+    """Delete matching cache file(s) — called by run-completion reconciler."""
+    import glob
+    pat = f"visual-cache-{station or '*'}-{month or '*'}-{re.sub(r'[^a-z0-9]+', '-', (dj or '').lower()).strip('-')[:40] or '*'}.json"
+    for f in glob.glob(os.path.join(VISUAL_CACHE_DIR, pat)):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def dandelion_sections(month):
+    """Full scrape returning [{artist,title}] for ONE DJ view is handled by
+    caller filtering; this returns ALL DJs' tracks flattened in page order
+    with a parallel '_dj' marker so per-DJ views stay page-faithful.
+    Returns None on fetch failure (fail-loud), [] when month has no page yet.
+    """
+    try:
+        from scrapling.fetchers import Fetcher
+    except ImportError:
+        return None
+    url = f"https://www.dandelionradio.com/tracklists/{month}/main.htm"
+    try:
+        with _SCRAPE_LOCK:
+            page = Fetcher.get(url)
+    except Exception:
+        return None
+    out, current = [], None
+    for tr in page.css("tr"):
+        b_tag = tr.css("td.tdblue b")
+        if b_tag:
+            raw = re.sub(r"<[^>]+>", "", b_tag[0].html_content).strip()
+            m = re.match(r"(.+?)\s*-\s*(January|February|March|April|May|June|"
+                         r"July|August|September|October|November|December)\s+\d{4}",
+                         raw)
+            if m:
+                current = m.group(1).strip()
+                continue
+        if tr.css("td.tdheadings"):
+            continue
+        tds = tr.css("td")
+        if len(tds) >= 2 and current:
+            artist = (tds[0].css("::text").get() or "").strip()
+            title = (tds[1].css("::text").get() or "").strip()
+            if artist and title and artist not in ("Artist", "&nbsp;"):
+                out.append({"artist": artist, "title": title, "_dj": current})
+    return out
+
 def months_with_playlists(station="dandelion"):
     """Set of 'YYYY-MM' months that have at least one station playlist.
 
