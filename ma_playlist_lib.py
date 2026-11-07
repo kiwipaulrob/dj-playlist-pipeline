@@ -254,6 +254,89 @@ def _provider_priority(t):
     return min(prios)
 
 
+# Most-preferred (lowest-priority-value) usable domain on a track record.
+# 7 Nov 2026: _pick_best reported mappings[0] as the provider, which mislabels
+# merged multi-mapping records (the first mapping is arbitrary, rarely local).
+def _best_domain(t):
+    best_prio, best_dom = None, ""
+    for m in (t.get("provider_mappings") or []):
+        d = m.get("provider_domain", "")
+        if d in PROVIDER_BLOCKED:
+            continue
+        p = PROVIDER_PRIORITY.get(d, PROVIDER_OTHER)
+        if best_prio is None or p < best_prio:
+            best_prio, best_dom = p, d
+    return best_prio, best_dom
+
+
+# The search fragment _pick_best last selected (module global, same pattern as
+# LAST_SEARCH_REASON — station search loops are single-threaded). search_ma
+# resolves it to a merged library item when a local copy exists (fix B).
+_LAST_PICK_RECORD = None
+
+LOCAL_DOMAINS = {"files", "filesystem", "filesystem_smb", "library"}
+
+
+def _resolve_to_local(token, rec):
+    """Upgrade a picked search fragment to its merged library-item URI.
+
+    music/search returns per-provider fragments (verified live 7 Nov 2026:
+    20/20 cross-provider results carried exactly 1 mapping), so the picked
+    fragment's URI pins one streaming copy. The library holds the MERGED item
+    (local file + provider mappings under one library:// URI) — returning that
+    instead keeps the playlist entry alive when any single provider dies.
+    Returns (uri, prov, name); None when no local-backed library item exists
+    (caller keeps the original fragment match — fail-soft, never a new failure
+    path; uses _api directly so the SEARCH_* counters stay clean).
+    """
+    try:
+        maps = [(m.get("provider_domain", ""), str(m.get("item_id", "")))
+                for m in (rec.get("provider_mappings") or [])]
+        maps = [(d, i) for d, i in maps if d and d not in PROVIDER_BLOCKED]
+        if not maps:
+            return None
+        if any(d in LOCAL_DOMAINS for d, _ in maps) and \
+                (rec.get("uri") or "").startswith("library://"):
+            return (rec.get("uri", ""), "library", rec.get("name", "?"))
+        lib = _api(token, {"message_id": "r",
+                           "command": "music/tracks/library_items",
+                           "args": {"search": (rec.get("name") or "")[:60],
+                                    "limit": 25}}, timeout=30)
+        if not isinstance(lib, list):
+            return None
+        want = set(maps)
+        for item in lib:
+            imaps = {(m.get("provider_domain", ""), str(m.get("item_id", "")))
+                     for m in (item.get("provider_mappings") or [])}
+            if want & imaps:
+                if any(d in LOCAL_DOMAINS for d, _ in imaps):
+                    return ("library://track/%s" % item.get("item_id"),
+                            "library",
+                            item.get("name") or rec.get("name") or "?")
+                return None  # merged item found, but no local copy — stop
+        return None
+    except Exception:
+        return None
+
+
+def _with_local_resolution(token, pick):
+    """search_ma post-step: prefer the merged local-backed library URI.
+
+    Any library:// URI is reported with prov "library" — the entry is
+    provider-independent (MA resolves playback across the item's mappings),
+    so naming one backing copy would mislead run logs.
+    """
+    global _LAST_PICK_RECORD
+    if _LAST_PICK_RECORD:
+        resolved = _resolve_to_local(token, _LAST_PICK_RECORD)
+        if resolved:
+            return resolved
+    uri, prov, name = pick
+    if (uri or "").startswith("library://"):
+        return (uri, "library", name)
+    return pick
+
+
 def _is_timeout(e):
     """True when an exception is a request timeout (possibly nested in URLError)."""
     if isinstance(e, (TimeoutError, socket.timeout)):
@@ -372,15 +455,24 @@ def search_ma(token, artist, title):
     # Delta-snapshot the run-global error counters so failure classification
     # reflects THIS call only (the counters accumulate across the whole run).
     t0_timeouts, t0_errors = SEARCH_TIMEOUTS, SEARCH_ERRORS
-    # Library-only first (fast — local files & shares)
-    for query in _query_strategies(artist, title):
+    # Library-only first (fast — local files & shares).
+    # 7 Nov 2026 (fix A): the artist+title formulation returns ZERO rows from
+    # the library path (verified live: "TV on the Radio Wolf Like Me" -> 0,
+    # title-only -> 4 merged records). Single-artist lookups previously never
+    # got a title-only try, so the local-first path always missed. Append it —
+    # _pick_best's artist validation still gates every candidate.
+    lib_queries = list(_query_strategies(artist, title))
+    _title_only = _norm_query_text(_clean_title(title))[:60]
+    if _title_only and _title_only not in lib_queries:
+        lib_queries.append(_title_only)
+    for query in lib_queries:
         payload = {"message_id": "s", "command": "music/search",
                    "args": {"search_query": query[:90], "media_types": ["track"],
                             "limit": 20, "library_only": True}}
         match = _pick_best(_do_search(token, payload), artist, title)
         if match:
             LAST_SEARCH_REASON = None
-            return match
+            return _with_local_resolution(token, match)
 
     # Fall back to cross-provider search (slow — Deezer, Bandcamp, Spotify).
     # limit=20 so multiple providers' copies of the same track show up for
@@ -397,7 +489,7 @@ def search_ma(token, artist, title):
         match = _pick_best(result, artist, title)
         if match:
             LAST_SEARCH_REASON = None
-            return match
+            return _with_local_resolution(token, match)
     # Every strategy exhausted — classify WHY using this call's counter deltas:
     # timeout wins (transient MA/network trouble → worth re-running fill),
     # then api_error (same), else genuinely absent from every provider.
@@ -437,10 +529,13 @@ def _artist_words(artist):
 
 
 def _pick_best(result, artist, title):
+    global _LAST_PICK_RECORD
     if not result:
+        _LAST_PICK_RECORD = None
         return None
     tracks = result.get('tracks', [])
     if not tracks:
+        _LAST_PICK_RECORD = None
         return None
 
     al, tl = artist.lower()[:15], title.lower()[:25]
@@ -481,9 +576,11 @@ def _pick_best(result, artist, title):
         if best_prio is None or prio < best_prio or (prio == best_prio and s > bs):
             best, bs, best_prio = t, s, prio
     if best:
-        mappings = best.get('provider_mappings') or []
-        prov = mappings[0].get('provider_domain', '') if mappings else ''
-        return (best.get('uri', ''), prov, best.get('name', '?'))
+        _LAST_PICK_RECORD = best
+        # 7 Nov 2026 (fix C): report the priority-WINNING domain, not
+        # mappings[0] — on merged records the first mapping is arbitrary.
+        return (best.get('uri', ''), _best_domain(best)[1], best.get('name', '?'))
+    _LAST_PICK_RECORD = None
     return None
 
 

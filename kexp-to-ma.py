@@ -62,9 +62,13 @@ def kexp_month_tracks(month, dj=None):
             print(f"  ⚠️  No KEXP episodes matched '{dj}' in {month} "
                   f"(full /shows/ archive walked) — nothing to build")
             return []
-    plays = ddlib.kexp_play_walk(month, show_ids=show_ids)
-    if plays is None:
+    # PR-F (24 Aug 2026): shared month-walk cache + 5000-row pages. The walk
+    # is show-tagged [(artist, title, show_id)]; filter inline.
+    all_plays = ddlib.kexp_play_walk_cached(month)
+    if all_plays is None:
         return None
+    plays = all_plays if not show_ids else \
+        [(a, t) for a, t, sid in all_plays if sid in set(show_ids)]
     seen, tracks = set(), []
     for artist, title in plays:
         key = f"{artist.lower()}|{title.lower()}"

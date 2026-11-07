@@ -494,6 +494,13 @@ class Handler(BaseHTTPRequestHandler):
             station = query.get("station", "dandelion")
             if station == "kexp":
                 programs, hosts = lib.kexp_options()
+                if programs is None:
+                    # API down — return 503 so the dashboard can flag it
+                    self._send(503, json.dumps({
+                        "error": "KEXP API unavailable",
+                        "message": "api.kexp.org/v2 is unreachable — check back later",
+                        "shows": [], "djs": []}).encode())
+                    return
                 self._send(200, json.dumps({"shows": programs, "djs": hosts}).encode())
             else:
                 self._send(200, json.dumps({"shows": [], "djs": lib.station_djs("dandelion")}).encode())
@@ -574,6 +581,17 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": False,
                     "error": f"busy — {n_active} runs already active (max 2). "
                              f"Wait or cancel before triggering another."}).encode())
+                return
+            if station == "kexp" and not lib.kexp_api_up():
+                # Fail-fast (Nov 2026): api.kexp.org outage — the run script
+                # would die on its first API call. Reject here so the user
+                # sees WHY instead of a "running" job that silently exits.
+                self._send(503, json.dumps({
+                    "ok": False,
+                    "error": "KEXP API unavailable (api.kexp.org/v2 unreachable — "
+                             "station outage, not a dashboard bug). "
+                             "Cached playlists below are still browsable; "
+                             "retry the run once KEXP is back."}).encode())
                 return
             existing = lib.existing_for(month, dj, station)
             if existing is None:

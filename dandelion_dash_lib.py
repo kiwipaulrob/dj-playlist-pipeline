@@ -249,7 +249,17 @@ def _source_tracks(station, month, dj=None):
                 show_ids = kexp_episode_ids(month, dj)
                 if show_ids is None:
                     return None          # API failure — fail loud (503)
-            plays = kexp_play_walk(month, show_ids=show_ids)
+            # PR-F: month-level cache — the cached walk is UNFILTERED
+            # (show_ids=None), so every show of a month shares one walk.
+            # Show filtering happens here, client-side, from episode ids.
+            all_plays = kexp_play_walk_cached(month)
+            if all_plays is None:
+                return None
+            if show_ids is None:
+                plays = [(a, t) for a, t, _sid in all_plays]
+            else:
+                want = set(show_ids)
+                plays = [(a, t) for a, t, sid in all_plays if sid in want]
             if plays is None:
                 return None
             seen, out = set(), []
@@ -349,7 +359,8 @@ def visual_rows(station, month, dj):
 
     pmap = _playlist_map_dualkey(pl_tracks) if pl_tracks else {}
 
-    rows, matched = [], 0
+    rows, matched, hearts = [], 0, 0
+    fav_keys, _fu = get_favourites()   # cached 30s; norm-key matched (see below)
     for pos, t in enumerate(src, 1):
         artist, title = t.get("artist", ""), t.get("title", "")
         k_raw = f"{artist.strip().lower()}|{title.strip().lower()}"
@@ -361,11 +372,29 @@ def visual_rows(station, month, dj):
         if hit:
             matched += 1
             img, prov = _track_image(hit)
-            row.update(found=True, image=img, provider=prov)
+            # PR-F: provider hyperlink. Deezer ids map 1:1 to public track pages;
+            # bandcamp/SMB have no derivable external URL -> MA web UI deep link.
+            link = None
+            hit_uri = hit.get("uri") or ""
+            pm0 = (hit.get("provider_mappings") or [{}])[0]
+            if prov == "deezer" and pm0.get("item_id"):
+                link = f"https://www.deezer.com/track/{pm0['item_id']}"
+            elif hit_uri.startswith("deezer://track/"):
+                link = "https://www.deezer.com/track/" + hit_uri.split("/")[-1]
+            row.update(found=True, image=img, provider=prov, url=link)
+            # PR-F: favourite heart — Paul hearts library:// items while playlist
+            # entries are their streaming mappings, so match by normalized
+            # artist+title key (same key family the liked-counter uses), trying
+            # both raw and cleaned variants.
+            is_fav = (k_raw in fav_keys) or \
+                     (norm(f"{prim} {mplib._clean_title(title)}") in fav_keys)
+            row["fav"] = bool(is_fav)
+            if is_fav:
+                hearts += 1
         else:
             u = unav.get(k_raw) or {}
             row.update(found=False, reason=u.get("reason", ""),
-                       attempts=u.get("attempts"))
+                       attempts=u.get("attempts"), url=None, fav=False)
         rows.append(row)
 
     return {
@@ -373,7 +402,7 @@ def visual_rows(station, month, dj):
         "exists": pl_tracks is not None,
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "summary": {"total": len(rows), "matched": matched,
-                    "unavailable": len(rows) - matched},
+                    "unavailable": len(rows) - matched, "hearts": hearts},
         "tracks": rows,
     }
 
@@ -628,9 +657,14 @@ def kexp_play_walk(month, show_ids=None, max_pages=100):
     `airdate_before=` (verified: July 2026 window = 12,458 plays in 13 pages
     of limit=1000), `ordering=` (ascending reaches back to 2000-12-31),
     `artist=`/`song=`/`album=` (true historical search), and offset
-    pagination. So: query the month window at limit=1000, filter client-side
+    pagination. So: query the month window, filter client-side
     for play_type == "trackplay" and (optionally) numeric show id in
     show_ids. Returns [(artist, title), ...]; None on API failure.
+
+    PR-F (24 Aug 2026): page size raised 1000→5000 — KEXP's per-request
+    latency (~2.5 s/page at 1000) dominates; 5000-row pages cut the July
+    month walk from 13 pages/~33 s to 3 pages/~24 s. Verified live: same
+    result count at both page sizes.
     """
     after = f"{month}-01T00:00:00-07:00"
     y, m = month.split("-")
@@ -642,7 +676,7 @@ def kexp_play_walk(month, show_ids=None, max_pages=100):
         try:
             d = _kexp_get(
                 f"/plays/?airdate_after={after}&airdate_before={before}"
-                f"&limit=1000&offset={offset}")
+                f"&limit=5000&offset={offset}")
         except Exception:
             return None
         res = d.get("results") or []
@@ -680,13 +714,63 @@ def kexp_play_walk(month, show_ids=None, max_pages=100):
                     and abs(ts - last_ts) <= 600:
                 last_ts = ts          # extend the repeat window
                 continue
-            out.append((artist, title))
+            out.append((artist, title, p.get("show")))
             _last, last_ts = key, ts
-        if len(res) < 1000:
+        if len(res) < 5000:
             break
-        offset += 1000
+        offset += 5000
         pages += 1
     return out
+
+
+def _filter_plays_by_shows(month, dj, show_ids):
+    """Filter the cached show-tagged walk [(artist, title, show_id)] to one
+    show's episode ids. Returns [(artist, title)]; [] when no episodes match
+    (legitimately empty — distinct from an API failure). Unused by visual_rows
+    since PR-F (it inlines the filter) but kept for other callers/tests."""
+    if not show_ids:
+        return []
+    want = set(show_ids)
+    tagged = kexp_play_walk(month)   # show-tagged tuples (a, t, show_id)
+    return [(a, t) for a, t, sid in tagged if sid in want]
+
+
+# PR-F: month-walk result cache (24 Aug 2026) — the /plays/ walk costs 20-40 s
+# per month regardless of page size (KEXP server latency). Every KEXP visual
+# view of the same month re-walks it; cache the deduped [(artist,title)] list
+# per month for 24 h so the first view pays and the rest are instant. Stored
+# as JSON via atomic_write_json; keyed by month only (show filtering happens
+# after, from the same cached list).
+WALK_CACHE_DIR = "/root/.hermes/data"
+WALK_TTL = 24 * 3600
+
+
+def _walk_cache_path(month):
+    return os.path.join(WALK_CACHE_DIR, f"kexp-walk-{month}.json")
+
+
+def kexp_play_walk_cached(month):
+    """kexp_play_walk(month, show_ids=None) with a 24 h month-level disk
+    cache. None passthrough on API failure (never cached — a failed walk
+    must retry)."""
+    p = _walk_cache_path(month)
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        if time.time() - d.get("_ts", 0) < WALK_TTL:
+            return [tuple(x) for x in d.get("plays", [])]
+    except Exception:
+        pass
+    plays = kexp_play_walk(month)
+    if plays is None:
+        return None
+    try:
+        mplib = __import__("ma_playlist_lib")
+        mplib.atomic_write_json(p, {"_ts": time.time(),
+                                    "plays": [list(x) for x in plays]})
+    except Exception:
+        pass
+    return plays
 
 
 def kexp_expected(month, show=None):
@@ -704,9 +788,12 @@ def kexp_expected(month, show=None):
             show_ids = kexp_episode_ids(month, show)
             if show_ids is None:
                 return {}
-        plays = kexp_play_walk(month, show_ids=show_ids)
-        if plays is None:
+        # PR-F: shared month-walk cache + inline show filter (3-tuples)
+        all_plays = kexp_play_walk_cached(month)
+        if all_plays is None:
             return {}
+        plays = all_plays if not show_ids else \
+            [(a, t) for a, t, sid in all_plays if sid in set(show_ids)]
         seen, count = set(), 0
         for artist, title in plays:
             key = f"{artist.lower()}|{title.lower()}"
@@ -718,14 +805,24 @@ def kexp_expected(month, show=None):
         return {}
 
 
-_kexp_opts_cache = {"ts": 0, "programs": [], "hosts": []}
+_kexp_opts_cache = {"ts": 0, "programs": [], "hosts": [], "fail_ts": 0}
+_KEXP_OPTS_FAIL_TTL = 300  # re-probe at most every 5 min while the API is down
+_KEXP_PROBE_TIMEOUT = 10  # fast fail — full fetch would block the dash for 60s+
 
 
 def kexp_options():
-    """Return (programs, hosts) — all KEXP shows and DJs, cached 6h."""
+    """Return (programs, hosts) — all KEXP shows and DJs, cached 6h.
+
+    On first fetch after a cache miss, if the KEXP API is unreachable
+    (HTTP errors, timeouts, connection refused), return (None, None) so the
+    dashboard can flag "API unavailable" to the user.  On subsequent ticks the
+    cache expiry will trigger a re‑probe; a transient outage heals automatically.
+    """
     now = time.time()
     if _kexp_opts_cache["programs"] and now - _kexp_opts_cache["ts"] < 21600:
         return _kexp_opts_cache["programs"], _kexp_opts_cache["hosts"]
+    if now - _kexp_opts_cache["fail_ts"] < _KEXP_OPTS_FAIL_TTL:
+        return None, None  # recent probe failed — don't hammer a dead API
 
     def fetch_all(path, key):
         out, offset = [], 0
@@ -734,7 +831,7 @@ def kexp_options():
                 f"https://api.kexp.org/v2/{path}?limit=100&offset={offset}",
                 headers={"User-Agent": "hermes-agent/1.0"})
             try:
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with urllib.request.urlopen(req, timeout=_KEXP_PROBE_TIMEOUT) as r:
                     d = json.loads(r.read())
             except Exception:
                 break
@@ -750,8 +847,40 @@ def kexp_options():
 
     programs = fetch_all("programs", "name")
     hosts = fetch_all("hosts", "name")
-    _kexp_opts_cache.update(ts=now, programs=programs, hosts=hosts)
+    # If both lists are empty after a full scan, treat it as API down
+    # rather than "no shows/DJs" — a real empty result would have some items.
+    if not programs and not hosts:
+        _kexp_opts_cache.update(ts=now, programs=[], hosts=[], fail_ts=now)
+        return None, None
+    _kexp_opts_cache.update(ts=now, programs=programs, hosts=hosts, fail_ts=0)
     return programs, hosts
+
+
+def kexp_api_up():
+    """Fast KEXP API liveness probe — one small request, True/False.
+
+    Uses the options cache when warm (no network). Otherwise a single
+    /programs/?limit=1 call with the short probe timeout. Never raises.
+    """
+    now = time.time()
+    if _kexp_opts_cache["programs"] and now - _kexp_opts_cache["ts"] < 21600:
+        return True
+    if now - _kexp_opts_cache["fail_ts"] < _KEXP_OPTS_FAIL_TTL:
+        return False
+    try:
+        req = urllib.request.Request(
+            "https://api.kexp.org/v2/programs/?limit=1",
+            headers={"User-Agent": "hermes-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=_KEXP_PROBE_TIMEOUT) as r:
+            d = json.loads(r.read())
+        ok = bool((d.get("results") or []))
+        _kexp_opts_cache.update(
+            ts=now if ok else _kexp_opts_cache["ts"],
+            fail_ts=0 if ok else now)
+        return ok
+    except Exception:
+        _kexp_opts_cache["fail_ts"] = now
+        return False
 
 
 def known_months(station="dandelion"):

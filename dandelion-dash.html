@@ -58,6 +58,10 @@ h1 { font-size:20px; margin-bottom:4px; }
 .vmeta .why.timeout, .vmeta .why.api_error { background:#3b2a10; color:#f0883e; }
 .vmeta .why:not(.no_match):not(.timeout):not(.api_error) { background:#24292e; color:var(--muted); }
 .vlink::before { content:'·'; margin:0 2px; color:var(--muted); }
+/* PR-F: hearts + track hyperlinks */
+.heart { color:#e5534b; font-weight:700; }
+.vmeta a.vtlink { color:var(--muted); text-decoration:none; }
+.vmeta a.vtlink:hover { color:var(--acc); text-decoration:underline; }
 .card .dj { font-weight:600; margin-bottom:2px; }
 .malink { font-size:11px; font-weight:500; color:var(--acc); text-decoration:none;
          margin-left:8px; border:1px solid var(--border); border-radius:4px; padding:1px 6px; }
@@ -99,7 +103,11 @@ form button { background:var(--acc); border:none; color:#0d1117; font-weight:600
 .runs { margin-top:20px; }
 .runs h2 { font-size:15px; margin-bottom:8px; }
 .runrow { font-size:12px; color:var(--muted); padding:3px 0; border-bottom:1px dashed var(--border); }
-</style>
+.api-error-banner { background:#3d1618; border:1px solid var(--bad); border-radius:8px; padding:12px 16px; margin-bottom:14px; }
+.api-error-banner .title { color:var(--bad); font-weight:600; font-size:14px; margin-bottom:6px; }
+.api-error-banner .msg { color:var(--muted); font-size:12px; line-height:1.5; }
+.api-error-chip { color:var(--bad); border-color:var(--bad); cursor:pointer; }
+.api-error-chip b { color:var(--bad); }</style>
 </head>
 <body>
 <div class="stattabs" id="stattabs"></div>
@@ -109,6 +117,7 @@ form button { background:var(--acc); border:none; color:#0d1117; font-weight:600
 
 <div class="badges" id="badges"></div>
 
+<div id="api-error-form-banner"></div>
 <form id="trig">
   <div><label>Month</label><input id="t-month" type="month" required></div>
   <div style="width:260px"><label id="t-dj-label">DJ / Show (optional)</label>
@@ -138,14 +147,28 @@ const STATIONS = [
   { id:'kexp', name:'KEXP', tag:'Seattle · public radio',
     logo:'/static/kexp-logo.svg', favicon:'/static/kexp-favicon.png' },
 ];
-let DATA = null, curMonth = null, station = 'dandelion';
+let DATA = null, curMonth = null, station = 'dandelion', kexpApiError = false;
 let OPTIONS = {shows: [], djs: []};
 
 async function loadOptions() {
   try {
     const r = await fetch('/api/options?station=' + station);
-    OPTIONS = await r.json();
-  } catch (e) { OPTIONS = {shows: [], djs: []}; }
+    if (r.status === 503) {
+      // KEXP API unavailable - get error details
+      const err = await r.json().catch(() => ({}));
+      kexpApiError = true;
+      OPTIONS = {shows: [], djs: []};
+      showApiError(err.message || 'KEXP API unavailable — check back later');
+    } else {
+      kexpApiError = false;
+      OPTIONS = await r.json();
+      clearApiError();
+    }
+  } catch (e) {
+    kexpApiError = false;
+    OPTIONS = {shows: [], djs: []};
+    clearApiError();
+  }
   const sel = document.getElementById('t-dj');
   const prev = sel.value;
   sel.innerHTML = '<option value="">— all —</option>';
@@ -169,6 +192,42 @@ async function loadOptions() {
   sel.onchange = () => renderStationBar();
   document.getElementById('t-dj-label').textContent =
     station === 'kexp' ? 'Show / DJ (optional)' : 'DJ (optional)';
+  renderStationBar();  // refresh the ⚠ API-down chip immediately (load() ran before us)
+}
+
+function showApiError(message) {
+  // Stationbar banner
+  const bar = document.getElementById('stationbar');
+  if (bar) {
+    const existing = document.getElementById('api-error-banner');
+    if (!existing) {
+      const banner = document.createElement('div');
+      banner.id = 'api-error-banner';
+      banner.className = 'api-error-banner';
+      banner.innerHTML = '<div class="title">⚠ KEXP API Unavailable</div><div class="msg">' + escapeHtml(message) + '</div>';
+      bar.parentNode.insertBefore(banner, bar);
+    }
+  }
+  // Also show in the trigger form area so users see it when trying to run
+  const formBanner = document.getElementById('api-error-form-banner');
+  if (formBanner) {
+    let inner = document.getElementById('api-error-form-banner-inner');
+    if (!inner) {
+      const banner = document.createElement('div');
+      banner.id = 'api-error-form-banner-inner';
+      banner.className = 'api-error-banner';
+      formBanner.appendChild(banner);
+      inner = banner;
+    }
+    inner.innerHTML = '<div class="title">⚠ KEXP API Unavailable</div><div class="msg">' + escapeHtml(message) + '</div>';
+  }
+}
+
+function clearApiError() {
+  for (const id of ['api-error-banner', 'api-error-form-banner-inner']) {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }
 }
 
 async function load() {
@@ -176,11 +235,13 @@ async function load() {
     const r = await fetch('/api/status?station=' + station);
     DATA = await r.json();
   } catch (e) { document.getElementById('grid').textContent = 'status API unreachable'; return; }
+  // NOTE: no clearApiError() here — /api/status succeeds from MA cache even
+  // while the KEXP API is down. Banner lifecycle belongs to loadOptions().
   document.getElementById('generated').textContent =
     'Updated ' + DATA.generated + ' · ' + DATA.favourites_total + ' liked songs in MA library';
   const months = Object.keys(DATA.months || {}).sort().reverse();
   if (!curMonth && months.length) curMonth = months[0];
-  renderStationBar(); renderBadges(months); renderTabs(months); renderGrid(); renderRuns();
+  renderStationBar(); renderBadges(months); renderTabs(months); renderGrid(); renderRuns(); loadOptions();
 }
 
 function renderStationBar() {
@@ -190,9 +251,12 @@ function renderStationBar() {
   const sub = station === 'kexp'
     ? (picked ? 'Seattle · ' + picked : 'Seattle · public radio · The Midday Show default')
     : st.tag;
+  const apiChip = (station === 'kexp' && kexpApiError)
+    ? '<span class="prov api-error-chip" title="KEXP API currently unreachable — builds will fail">⚠ API down</span>'
+    : '';
   document.getElementById('stationbar').innerHTML =
     `<img class="stationlogo" src="${st.logo}" alt="${st.name}" onerror="this.style.display='none'">` +
-    `<div class="stationinfo"><h2>${st.name}${picked ? ' — ' + picked : ''}</h2><div class="tag">${sub}</div></div>`;
+    `<div class="stationinfo"><h2>${st.name}${picked ? ' — ' + picked : ''}</div><div class="tag">${sub}${apiChip}</div></div>`;
   // swap the browser-tab favicon to the active station's
   const fav = document.getElementById('favicon');
   if (fav && st.favicon) {
@@ -349,19 +413,24 @@ async function showVisual(stationArg, monthArg, djArg) {
     `<div class="stationinfo"><h2>${escapeHtml(v.dj)}</h2>` +
     `<div class="tag">${v.station === 'kexp' ? 'KEXP' : 'Dandelion Radio'} · ${escapeHtml(v.month)} · ` +
     `${s.total} tracks · ${s.matched} matched · ${s.unavailable} unavailable` +
+    `${s.hearts ? ` · <span class="heart">♥</span> ${s.hearts} liked` : ''}` +
     `${v.exists ? '' : ' · <b>not built yet — preview from tracklist</b>'}` +
     `${v.cached ? ' · cached' : ''}</div></div>`;
   document.title = v.dj + ' — visual playlist';
 
   grid.innerHTML = '<div class="vgrid">' + v.tracks.map(t => {
     const u = artUrl(t);
+    const titleHtml = t.url
+      ? `<a class="vt vtlink" href="${escapeHtml(t.url)}" target="_blank" rel="noopener">${escapeHtml(t.title)}</a>`
+      : `<span class="vt">${escapeHtml(t.title)}</span>`;
+    const heart = t.fav ? ' <span class="heart">♥</span>' : '';
     if (t.found) {
       const img = u
         ? `<img loading="lazy" alt="" src="${escapeHtml(u)}" onload="this.classList.add('ok')" onerror="this.closest('.vtile').classList.add('mono'); this.remove()">`
         : '';
       return `<div class="vtile${u ? '' : ' mono'}">${img}` +
         `<div class="vfall">${escapeHtml(monogram(t.artist, t.title))}</div>` +
-        `<div class="vmeta"><span class="va">${escapeHtml(t.artist)}</span><span class="vt">${escapeHtml(t.title)}</span>` +
+        `<div class="vmeta"><span class="va">${escapeHtml(t.artist)}${heart}</span>${titleHtml}` +
         `<span class="prov vp">${escapeHtml(t.provider || '')}</span></div></div>`;
     }
     const why = t.reason || 'not in playlist';
@@ -401,6 +470,10 @@ document.getElementById('trig').onsubmit = async (e) => {
   const dj = document.getElementById('t-dj').value.trim() || null;
   const mode = document.getElementById('t-mode').value;
   const msg = document.getElementById('msg');
+  if (station === 'kexp' && kexpApiError) {
+    msg.textContent = '❌ KEXP API unavailable — run blocked before it could fail. Cached playlists below are still browsable; retry once KEXP is back.';
+    return;
+  }
   msg.textContent = 'triggering ' + station + ' ' + month + (dj ? ' · ' + dj : '') + ' (' + mode + ')…';
   try {
     const r = await fetch('/api/trigger', {method:'POST', headers:{'Content-Type':'application/json'},
