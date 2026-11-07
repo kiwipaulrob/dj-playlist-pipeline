@@ -56,6 +56,11 @@ report expected-vs-found.
 | `test_pr2_existing.py` | Test suite: `existing_for()` outage disambiguation + trigger 503/routing; installs a tripwire so any unmocked `launch_run` fails loudly instead of spawning real runs |
 | `test_pr3_cosmetic.py` | Test suite: `search_ma` phases, `_pick_best` guards, `kexp-rebuild-months` argparse |
 | `kexp-rebuild-months.py` | Maintenance tool: deterministic remove-all → re-add rebuild of existing KEXP months (favourites-safe, fail-loud ordering). Months are CLI args now: `kexp-rebuild-months.py 2026-05 2026-06 [--dj "Cheryl Waters"]` (default: previous month) |
+| `dj_playlist_local_sweep.py` | **Local-first sweep** (Nov 2026): walks every Dandelion/KEXP playlist and swaps provider-pinned entries for local-backed merged `library://` items. Per-playlist JSON snapshots, serialized removes (favourites-safe — a remove that would eat a liked track aborts the playlist instead), poison-bisect add batching (a failing chunk splits down to the single bad track), `--recover` mode to restore any playlist from its snapshot. Run it after adding local files or losing a provider |
+| `ma-merge-dandelion-duplicates.py` | One-shot: folds duplicate Dandelion playlists (same show/month built twice) into merge-backed copies, favourites preserved |
+| `dandelion-email-summary.py` | Emails a per-provider count summary of the dashboard (run-report mail) |
+| `kexp-rebuild-all.py` / `kexp-rebuild-watch.py` / `kexp-rebuild-june-july.py` | One-shot KEXP rebuild helpers: bulk rebuild via single-call adds, a watcher that waits on rebuild systemd units and reports, and the June–July 2026 chunked rebuild |
+| `dj-pipeline-github-sync.sh` | Ops: daily one-way sync of exactly these files to this repo (allowlist-only, secret-gated, never force-pushes). Runs as a silent-unless-changed scheduler job; `--check` reports without writing |
 | `dandelion-cron.sh` / `kexp-cron.sh` | Monthly cron wrappers (2nd, previous month, `--resume`) |
 | `dandelion-fill-cron.sh` / `kexp-fill-cron.sh` | Monthly fill wrappers (3rd, catches late matches) |
 
@@ -266,6 +271,28 @@ covers; KEXP Cheryl Waters July 2026 → 548/656 matched, 542 covers.
 (ids/names preserved): fetch true month → search (cacheable) → remove all positions
 → verify empty → add true set → verify count, favourites checked before/after.
 Use it when historical months were built by an older, wrong access path.
+
+## Local-first playback (Nov 2026)
+
+`music/search` returns per-provider fragments, so a picked match used to pin one
+streaming copy (e.g. a Deezer URI) into the playlist — and the entry died with that
+provider. `search_ma` now resolves every pick to the **merged library item** when a
+local copy exists (`_resolve_to_local` / `_with_local_resolution` in
+`ma_playlist_lib.py`): the playlist holds a provider-independent `library://` URI
+and MA resolves playback across the item's mappings. Fail-soft — tracks with no
+local copy keep their original fragment match; nothing new can fail.
+
+`dj_playlist_local_sweep.py` retrofits the existing 100+ DJ playlists to the same
+standard: per playlist it diffs entries against local-backed merges, snapshots
+before touching anything (`data/sweep-snapshots/`), removes in small serialized
+batches (a batch that would remove a favourited track aborts that playlist, likes
+intact), re-adds with poison-bisect (a failing chunk of 25 splits down to the one
+bad track), and verifies counts. `--recover` restores any playlist from snapshot.
+After any provider loss or local-library ingest, re-running the sweep is the fix.
+
+This repo stays current via `dj-pipeline-github-sync.sh` (daily, silent unless
+something changed) — the working files live in the homelab scripts directory and
+are pushed here, never the other way round.
 
 ---
 
