@@ -240,6 +240,17 @@ def batched_add_all(token, pid, name, items):
                 added = n1
                 continue
             print(f"    ☠️  poison: {artist} - {title} [{uri[:60]}] — fresh lookup")
+            # 8 Nov 2026 double-add fix: the "failed" original may have landed
+            # late (async add tasks) — if the song is present now, count it as
+            # added instead of stacking a substitute beside it.
+            try:
+                present = mplib.playlist_track_keys(token, pid) or set()
+            except Exception:
+                present = set()
+            if mplib.norm_key(artist, title) in present:
+                print("    ↩️  original landed late — no substitute needed")
+                added = len(fetch_tracks(token, pid) or [])
+                continue
             rep = fresh_replacement(token, artist, title)
             if rep and rep != uri:
                 n2 = add_until(token, pid, name + "-single", [rep], before + 1)
