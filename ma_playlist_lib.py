@@ -502,6 +502,38 @@ def search_ma(token, artist, title):
     return None
 
 
+def search_local_merge(token, artist, title):
+    """Song-identity lookup for a LOCAL-backed library merge (sweep use).
+
+    _resolve_to_local matches by provider-mapping intersection, which misses
+    whenever catalogue IDs vary across regions/providers for the same
+    recording (verified live 9 Nov 2026: Pulp's Deezer fragment missed the
+    local-backed merge its own fresh search_ma lookup finds). This instead
+    runs search_ma's library-only query strategies and accepts the pick only
+    when its record resolves to a local-backed merge — same artist validation
+    (_pick_best), no cross-provider fan-out (a streaming copy is no upgrade).
+    Returns (library_uri, name) or None. Uses _api directly so the SEARCH_*
+    counters stay clean.
+    """
+    try:
+        lib_queries = list(_query_strategies(artist, title))
+        _title_only = _norm_query_text(_clean_title(title))[:60]
+        if _title_only and _title_only not in lib_queries:
+            lib_queries.append(_title_only)
+        for query in lib_queries:
+            payload = {"message_id": "sl", "command": "music/search",
+                       "args": {"search_query": query[:90], "media_types": ["track"],
+                                "limit": 20, "library_only": True}}
+            match = _pick_best(_do_search(token, payload), artist, title)
+            if match and _LAST_PICK_RECORD:
+                resolved = _resolve_to_local(token, _LAST_PICK_RECORD)
+                if resolved and resolved[0].startswith("library://"):
+                    return (resolved[0], resolved[2])
+        return None
+    except Exception:
+        return None
+
+
 STOPWORDS = {"the", "and", "feat", "ft", "with", "various", "artists", "artist",
              "various_artists", "unknown", "soundtrack", "original", "cast"}
 # Words so generic they match half the catalogue — never used for artist validation.

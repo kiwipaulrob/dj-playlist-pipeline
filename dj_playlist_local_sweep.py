@@ -94,8 +94,8 @@ def plan_playlist(token, pid, delay):
         return None, None, {"error": "fetch failed"}
     tracks = sorted(tracks, key=lambda t: t.get("position", 0))
     swaps, stats = [], {"total": len(tracks), "merged": 0, "local_direct": 0,
-                        "pinned": 0,
-                        "swappable": 0, "dup_skip": 0, "unresolved": 0}
+                        "pinned": 0, "swappable": 0, "by_identity": 0,
+                        "dup_skip": 0, "unresolved": 0}
     have_uris = {t.get("uri", "") for t in tracks}
     for t in tracks:
         uri = t.get("uri", "")
@@ -115,6 +115,19 @@ def plan_playlist(token, pid, delay):
         except Exception:
             new = None
         time.sleep(delay)
+        if not new or not new[0].startswith("library://"):
+            # 9 Nov 2026: mapping-intersection misses same recordings whose
+            # catalogue IDs vary by region/provider — retry by song identity
+            # (library-only, local-backed merges only).
+            try:
+                ident = mplib.search_local_merge(
+                    token, artists_str(t), t.get("name") or "")
+            except Exception:
+                ident = None
+            time.sleep(delay)
+            if ident:
+                new = ident
+                stats["by_identity"] += 1
         if not new or not new[0].startswith("library://"):
             stats["unresolved"] += 1
             continue
@@ -439,7 +452,7 @@ def main():
         totals["swappable"] += stats["swappable"]
         totals["already_merged"] += stats["merged"]
         print(f"  total={stats['total']} merged={stats['merged']} local-direct={stats['local_direct']} pinned={stats['pinned']} "
-              f"swappable={stats['swappable']} dup-skip={stats['dup_skip']} no-local={stats['unresolved']}")
+              f"swappable={stats['swappable']} (by-identity={stats['by_identity']}) dup-skip={stats['dup_skip']} no-local={stats['unresolved']}")
         for pos, old, new, tname, _a in swaps[:12]:
             print(f"    pos {pos}: {tname[:40]:40s} {old.split('://')[0]:20s} -> {new}")
         if len(swaps) > 12:
