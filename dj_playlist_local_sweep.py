@@ -155,6 +155,32 @@ def snapshot(pid, name, tracks):
     return path
 
 
+def _norm_title(t):
+    return re.sub(r"[^a-z0-9]+", " ", (t or "").lower()).strip()
+
+
+def fuzzy_title_hit(live, want_title, exclude_uris=()):
+    """Title-containment match for storm-late entries (9 Nov 2026).
+
+    MA's display artist for a re-added entry often differs from the snapshot
+    artist (label names on Bandcamp comps, 'Remastered' title variants), so
+    norm_key (artist|title) misses songs that ARE present. Titles are the
+    stable axis: hit when either normalized title contains the other.
+    Returns the matching live entry or None. exclude_uris skips entries
+    (e.g. the substitute itself when hunting its late original).
+    """
+    w = _norm_title(want_title)
+    if not w:
+        return None
+    for t in live:
+        if (t.get("uri", "") or "") in exclude_uris:
+            continue
+        lt = _norm_title(t.get("name", "?"))
+        if lt and (lt == w or w in lt or lt in w):
+            return t
+    return None
+
+
 def stable_tracks(token, pid, tries=6, pause=20):
     """Poll playlist_tracks until two consecutive reads agree. Never teardown."""
     last = None
@@ -273,12 +299,77 @@ def batched_add_all(token, pid, name, items):
                                           "old": uri, "new": rep})
                     print(f"    ✅ routed around: -> {rep[:70]}")
                     continue
+            # 9 Nov 2026: the "failed" original may have landed late with
+            # variant artist metadata (label-vs-artist) — fuzzy title check
+            # before declaring the song lost. False omissions (5217, 1301)
+            # were both present all along.
+            try:
+                cur = fetch_tracks(token, pid) or []
+            except Exception:
+                cur = []
+            if fuzzy_title_hit(cur, title):
+                print("    ↩️  original landed late (title match) — no omission")
+                added = len(cur)
+                continue
             omissions.append({"song": "%s - %s" % (artist, title), "uri": uri})
             print("    ❌ omission recorded (song kept out, everything else continues)")
         added = len(fetch_tracks(token, pid) or [])
         i += len(chunk)
     final = stable_tracks(token, pid)
-    return (len(final) if final is not None else -1), substitutions, omissions
+    final_n = len(final) if final is not None else -1
+    # 9 Nov 2026 post-pass: a substitute stacked beside its late-landing
+    # original (1301: 3 deezer dupes). For each recorded substitution, if
+    # the substitute URI is live AND the original song is live at another
+    # position, remove one of them — keep a library:// entry when present
+    # (sweep goal), else keep the original. Never removes a song's last copy.
+    if final and substitutions:
+        try:
+            by_uri = {}
+            for t in final:
+                by_uri.setdefault(t.get("uri", ""), []).append(t)
+            drop_positions = []
+            for sub in substitutions:
+                orig_hits = by_uri.get(sub["old"], [])
+                sub_hits = by_uri.get(sub["new"], [])
+                drop, keep = None, None
+                if orig_hits and sub_hits and sub_hits[0] is not orig_hits[0]:
+                    # Classic stack: original frag + frag substitute.
+                    drop, keep = (sub_hits[0].get("position", 0),
+                                  orig_hits[0].get("position", 0))
+                elif orig_hits and not sub_hits and sub["new"].startswith("library://"):
+                    # library:// substitutes report back as backing frags:
+                    # the same-song entry that ISN'T the original is ours —
+                    # but only when unambiguous (never touch remixes).
+                    want_title = sub["song"].split(" - ", 1)[-1]
+                    cands = [t for t in final
+                             if t.get("uri") != sub["old"]
+                             and fuzzy_title_hit([t], want_title) is not None]
+                    if len(cands) == 1:
+                        theirs = cands[0]
+                        local = lambda e: any(
+                            (m.get("provider_domain") or "") in
+                            ("files", "filesystem", "filesystem_smb", "library")
+                            for m in (e.get("provider_mappings") or []))
+                        if local(theirs) and not local(orig_hits[0]):
+                            drop, keep = (orig_hits[0].get("position", 0),
+                                          theirs.get("position", 0))
+                        else:
+                            drop, keep = (theirs.get("position", 0),
+                                          orig_hits[0].get("position", 0))
+                if drop is not None:
+                    drop_positions.append(drop)
+                    print(f"    🧹 late-dupe: {sub['song'][:50]:50s} "
+                          f"keeping pos {keep}, dropping pos {drop}")
+            if drop_positions:
+                if submit_remove(token, pid, sorted(drop_positions, reverse=True)):
+                    mplib.wait_for_add_tasks(token, name + "-dedupe", max_wait=600)
+                    final = stable_tracks(token, pid)
+                    final_n = len(final) if final is not None else -1
+                else:
+                    print("    ⚠️  dedupe remove failed — dupes stay, flagged by count check")
+        except Exception as e:
+            print(f"    ⚠️  dedupe pass failed ({e}) — dupes stay, flagged by count check")
+    return final_n, substitutions, omissions
 
 
 def fresh_replacement(token, artist, title, delay=0.3):
